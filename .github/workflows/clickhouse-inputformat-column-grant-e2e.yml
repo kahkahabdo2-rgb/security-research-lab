@@ -1,0 +1,103 @@
+name: Format header column override vs INSERT column grants E2E
+on:
+  push:
+    branches: [research-clickhouse-format-columns-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["26.10.3.7","head"]
+    steps:
+      - name: Start official ClickHouse
+        shell: bash
+        run: |
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 clickhouse/clickhouse-server:${{ matrix.image }}
+          for i in {1..95}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Attack format headers and Native blocks with only INSERT benign grant
+        shell: bash
+        run: |
+          cat >/tmp/probe.py <<'PY'
+          import base64,urllib.parse,urllib.request,urllib.error,json
+          users={"admin":"synthetic-admin-password","limited":"synthetic-limited-password"}
+          def raw(sql=None,blob=None,who="admin",params=None):
+              q=urllib.parse.urlencode(dict(params or {},**({"query":sql} if sql is not None and blob is not None else {})))
+              url="http://127.0.0.1:8123/"+("?" +q if q else "")
+              body=blob if blob is not None else sql.encode()
+              req=urllib.request.Request(url,data=body,method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode(f"{who}:{users[who]}".encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=25) as r:return r.status,r.read()
+              except urllib.error.HTTPError as e:return e.code,e.read()
+          def query(q,who="admin",settings=None):
+              c,b=raw(q,who=who,params=settings)
+              print("SQL",who,repr(q[:170]),c,repr(b[:310]),flush=True)
+              return c,b
+          def must(q):
+              c,b=query(q)
+              if c!=200:raise RuntimeError("SETUP_FAILED "+q+": "+str(c)+" "+str(b[:300]))
+          must("CREATE DATABASE column_lab")
+          must("CREATE TABLE column_lab.sink (secret String DEFAULT 'FIXED', benign String DEFAULT '') ENGINE=MergeTree ORDER BY tuple()")
+          must("CREATE TABLE column_lab.mat_sink (benign String, secret String MATERIALIZED concat('FIXED_',benign)) ENGINE=MergeTree ORDER BY tuple()")
+          must("CREATE USER limited IDENTIFIED WITH plaintext_password BY 'synthetic-limited-password'")
+          must("GRANT INSERT(benign) ON column_lab.sink TO limited")
+          must("GRANT INSERT(benign) ON column_lab.mat_sink TO limited")
+          print("GRANTS",query("SHOW GRANTS FOR limited"),flush=True)
+          assert query("INSERT INTO column_lab.sink (secret) VALUES ('PWNED_DIRECT')","limited")[0]==403
+          assert query("INSERT INTO column_lab.sink (benign) VALUES ('BASELINE')","limited")[0]==200
+          native0=raw("SELECT 'PWNED_NATIVE' AS secret FORMAT Native")[1]
+          native1=raw("SELECT 'OK_NATIVE' AS benign, 'PWNED_NATIVE2' AS secret FORMAT Native")[1]
+          arrow0=raw("SELECT 'PWNED_ARROW' AS secret FORMAT ArrowStream")[1]
+          print("GENERATED_NATIVE",len(native0),len(native1),"ARROW",len(arrow0),flush=True)
+          tests=[
+              ("csv_with_names_single","CSVWithNames",b"secret\nPWNED_CSV\n",{"input_format_with_names_use_header":"1"}),
+              ("csv_with_names_both","CSVWithNames",b"benign,secret\nOK_CSV,PWNED_CSV2\n",{"input_format_with_names_use_header":"1","input_format_skip_unknown_fields":"1"}),
+              ("tsv_with_names","TSVWithNames",b"secret\nPWNED_TSV\n",{"input_format_with_names_use_header":"1"}),
+              ("json_eachrow_both","JSONEachRow",b'{"benign":"OK_JSON","secret":"PWNED_JSON"}\n',{"input_format_skip_unknown_fields":"1"}),
+              ("json_eachrow_secret","JSONEachRow",b'{"secret":"PWNED_JSON_ONLY"}\n',{"input_format_skip_unknown_fields":"1"}),
+              ("json_columns_both","JSONColumns",b'{"benign":["OK_JCOL"],"secret":["PWNED_JCOL"]}',{"input_format_skip_unknown_fields":"1"}),
+              ("native_secret_only","Native",native0,{}),
+              ("native_both","Native",native1,{}),
+              ("arrow_secret_only","ArrowStream",arrow0,{}),
+          ]
+          def check():
+              c,b=query("SELECT secret,benign FROM column_lab.sink LIMIT 100 SETTINGS max_execution_time=10,max_rows_to_read=1000")
+              if c!=200:raise RuntimeError(b)
+              rows=[x.split("\t") for x in b.decode().splitlines() if "\t" in x]
+              pwned=[x for x in rows if x[0]!="FIXED"]
+              return rows,pwned
+          for label,fmt,payload,settings in tests:
+              q=f"INSERT INTO column_lab.sink (benign) FORMAT {fmt}"
+              code,body=raw(q,blob=payload,who="limited",params=settings)
+              rows,pwned=check()
+              print("ATTACK",label,"STATUS",code,"BODY",repr(body[:360]),"ROWS",rows[-10:],"PWNED_SECRET",pwned,flush=True)
+              if pwned:raise AssertionError("PRIVILEGE_BYPASS "+str(pwned))
+          for label,fmt,payload,settings in [
+              ("materialized_json","JSONEachRow",b'{"benign":"OK_MAT","secret":"PWNED_MAT"}\n',{"input_format_skip_unknown_fields":"1","insert_allow_materialized_columns":"1"}),
+              ("materialized_native","Native",native1,{"insert_allow_materialized_columns":"1"}),
+          ]:
+              c,b=raw(f"INSERT INTO column_lab.mat_sink (benign) FORMAT {fmt}",blob=payload,who="limited",params=settings)
+              s,rv=query("SELECT benign,secret FROM column_lab.mat_sink LIMIT 100 SETTINGS max_execution_time=10,max_rows_to_read=1000")
+              print("ATTACK",label,"STATUS",c,"BODY",repr(b[:300]),"ROWS",repr(rv[:450]),flush=True)
+              if s==200:
+                  for row in rv.decode().splitlines():
+                      parts=row.split("\t")
+                      if len(parts)==2 and parts[1]!=("FIXED_"+parts[0]):
+                          raise AssertionError("MATERIALIZED_COLUMN_OVERRIDE "+row)
+          print("NO_COLUMN_GRANT_BYPASS: all inserted rows retained the fixed secret; materialized columns validated",flush=True)
+          PY
+          python3 /tmp/probe.py
+      - name: Docker logs on error
+        if: failure()
+        run: docker logs ch 2>&1 | tail -100
