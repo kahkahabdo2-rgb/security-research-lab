@@ -1,0 +1,97 @@
+name: HTTP path PUT parser boundary E2E
+on:
+  push:
+    branches: [research-clickhouse-http-path-protocol-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Start isolated official ClickHouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/enable_paths.xml <<'XML'
+          <clickhouse>
+            <http_allow_path_requests>true</http_allow_path_requests>
+          </clickhouse>
+          XML
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -v /tmp/enable_paths.xml:/etc/clickhouse-server/config.d/paths.xml:ro \
+            clickhouse/clickhouse-server:head
+          for i in {1..90}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Test URI path / SQL / authority disagreements
+        shell: bash
+        run: |
+          cat >/tmp/probe.py <<'PY'
+          import base64,urllib.request,urllib.error
+          passwords={"admin":"synthetic-admin-password","writer":"synthetic-writer-password"}
+          def send(path,body,who="admin",method="POST",headers=None):
+              h=headers or {}
+              req=urllib.request.Request("http://127.0.0.1:8123"+path,
+                  data=body.encode() if body is not None else None,method=method)
+              req.add_header("Authorization","Basic "+base64.b64encode(f"{who}:{passwords[who]}".encode()).decode())
+              for k,v in h.items():req.add_header(k,v)
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:return r.status,r.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:return e.code,e.read().decode(errors="replace").strip()
+          def sql(q,w="admin"):
+              c,o=send("/",q,w)
+              print("SQL",w,repr(q),c,repr(o[:320]),flush=True)
+              return c,o
+          def must(q):
+              c,b=sql(q)
+              if c!=200:raise RuntimeError(f"SETUP_ERROR {q}: {c}, {b}")
+          def count(table):
+              c,b=sql(f"SELECT count() FROM http_boundary.{table} LIMIT 1 SETTINGS max_execution_time=10,max_rows_to_read=10000")
+              if c!=200:raise RuntimeError(b)
+              return int(b)
+          must("CREATE DATABASE http_boundary")
+          must("CREATE TABLE http_boundary.allowed (id UInt32) ENGINE=MergeTree ORDER BY id")
+          must("CREATE TABLE http_boundary.protected (id UInt32) ENGINE=MergeTree ORDER BY id")
+          must("INSERT INTO http_boundary.protected VALUES (9001)")
+          must("CREATE USER writer IDENTIFIED WITH plaintext_password BY 'synthetic-writer-password'")
+          must("GRANT INSERT ON http_boundary.allowed TO writer")
+          must("ALTER USER writer SETTINGS http_allow_database_as_path=1,http_allow_table_as_file=1")
+          print("GRANTS",sql("SHOW GRANTS FOR writer"),flush=True)
+          attempts=[
+              ("normal_allowed", "/http_boundary/allowed.CSV", "101\n", {}, True),
+              ("protected_plain", "/http_boundary/protected.CSV", "9002\n", {}, False),
+              ("encoded_dot", "/http_boundary/protected%2ECSV", "9003\n", {}, False),
+              ("encoded_slash_segment", "/http_boundary/allowed%2F..%2Fprotected.CSV", "9004\n", {}, False),
+              ("double_encoding", "/http_boundary/allowed%252F..%252Fprotected.CSV", "9005\n", {}, False),
+              ("query_plain", "/http_boundary/allowed.CSV?query=INSERT%20INTO%20http_boundary.protected%20VALUES%20(9006)", "1\n", {}, False),
+              ("query_case", "/http_boundary/allowed.CSV?QUERY=INSERT%20INTO%20http_boundary.protected%20VALUES%20(9007)", "1\n", {}, False),
+              ("query_mixed_case", "/http_boundary/allowed.CSV?Query=INSERT%20INTO%20http_boundary.protected%20VALUES%20(9008)", "1\n", {}, False),
+              ("database_conflict", "/http_boundary/allowed.CSV?database=default", "9009\n", {}, False),
+              ("database_header_conflict", "/http_boundary/allowed.CSV", "9010\n", {"X-ClickHouse-Database":"default"}, False),
+              ("inline_sql_after_csv", "/http_boundary/allowed.CSV", "103\nINSERT INTO http_boundary.protected VALUES (9011)\n", {}, False),
+              ("compressed_fake_suffix", "/http_boundary/allowed.CSV.gz", "9012\n", {}, False),
+              ("backtick_encoded", "/http_boundary/%60protected%60.CSV", "9013\n", {}, False),
+              ("path_suffix_extra", "/http_boundary/allowed.CSV%3Fquery%3DINSERT%20INTO%20http_boundary.protected", "9014\n", {}, False),
+          ]
+          protected_before=count("protected")
+          for name,path,body,heads,expected_success in attempts:
+              c,out=send(path,body,"writer","PUT",heads)
+              cprotected=count("protected")
+              target_untouched=cprotected==protected_before
+              print("PROBE",name,"STATUS",c,"TARGET_UNCHANGED",target_untouched,"OUT",repr(out[:300]),flush=True)
+              if not target_untouched:
+                  raise AssertionError(f"SECURITY_CANDIDATE: {name}: protected row changed")
+              if expected_success and c!=200:raise RuntimeError(f"SETUP_FAILURE: normal path upload failed: {c}: {out}")
+          print("FINAL_TARGET_ROWS",protected_before,count("protected"),flush=True)
+          print("VERDICT_NO_BYPASS: crafted encoded paths, mixed-case query parameters, database conflicts, malformed body did not write to protected target",flush=True)
+          PY
+          python3 /tmp/probe.py
+      - name: Logs if failure
+        if: failure()
+        run: docker logs ch 2>&1 | tail -100
