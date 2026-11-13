@@ -37,6 +37,7 @@ jobs:
           PYTHONPATH: upstream/deploy-board
           DJANGO_SETTINGS_MODULE: deploy_board.settings
           OAUTH_ENABLED: 'ON'
+          IS_PINTEREST: 'true'
           OAUTH_CLIENT_ID: 'lab-client'
           OAUTH_CLIENT_SECRET: 'lab-only-client-secret'
           OAUTH_CALLBACK: 'http://127.0.0.1:18888/auth'
