@@ -1,0 +1,92 @@
+name: HTTP PUT x Values interpreter x async queue permission boundary
+on:
+  push:
+    branches: [research-clickhouse-http-path-protocol-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["26.10.3.7","head"]
+    steps:
+      - name: Start stock ClickHouse with HTTP path requests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/http_paths.xml <<'XML'
+          <clickhouse>
+            <http_allow_path_requests>true</http_allow_path_requests>
+          </clickhouse>
+          XML
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -v /tmp/http_paths.xml:/etc/clickhouse-server/config.d/path_test.xml:ro \
+            clickhouse/clickhouse-server:${{ matrix.image }}
+          for i in {1..95}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Run cross-feature identity tests
+        shell: bash
+        run: |
+          cat > /tmp/e2e.py <<'PY'
+          import base64,urllib.request,urllib.error,urllib.parse,time
+          users={"admin":"synthetic-admin-password","writer":"synthetic-writer-password"}
+          def call(path,body=None,method="POST",who="admin"):
+              req=urllib.request.Request("http://127.0.0.1:8123"+path,data=body.encode() if body is not None else None,method=method)
+              req.add_header("Authorization","Basic "+base64.b64encode(f"{who}:{users[who]}".encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=35) as r:return r.status,r.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:return e.code,e.read().decode(errors="replace").strip()
+          def sql(q,who="admin"):
+              c,b=call("/",q,who=who)
+              print("SQL",who,repr(q),c,repr(b[:210]),flush=True)
+              return c,b
+          def setup(q):
+              c,b=sql(q)
+              if c!=200:raise RuntimeError(f"SETUP: {q}: {c} {b}")
+          setup("CREATE DATABASE auth_path")
+          setup("CREATE TABLE auth_path.secret (v UInt64) ENGINE=MergeTree ORDER BY v")
+          setup("CREATE TABLE auth_path.inbox (v UInt64) ENGINE=MergeTree ORDER BY v")
+          setup("INSERT INTO auth_path.secret VALUES (733331)")
+          setup("CREATE USER writer IDENTIFIED WITH plaintext_password BY 'synthetic-writer-password'")
+          setup("GRANT INSERT ON auth_path.inbox TO writer")
+          setup("ALTER USER writer SETTINGS http_allow_database_as_path=1,http_allow_table_as_file=1")
+          assert sql("SELECT v FROM auth_path.secret","writer")[0]==403, "Writer somehow has SELECT on secret"
+          assert sql("INSERT INTO auth_path.inbox SELECT v FROM auth_path.secret","writer")[0]==403, "Writer bypassed source SELECT"
+          assert sql("SELECT * FROM auth_path.inbox","writer")[0]==403, "Writer somehow has SELECT on inbox"
+          options=[
+            ("sync_plain", "input_format_values_interpret_expressions=1&async_insert=0", "( (SELECT v FROM auth_path.secret LIMIT 1) )"),
+            ("async_wait", "input_format_values_interpret_expressions=1&async_insert=1&wait_for_async_insert=1&async_insert_busy_timeout_ms=100", "( (SELECT v FROM auth_path.secret LIMIT 1) )"),
+            ("async_nowait", "input_format_values_interpret_expressions=1&async_insert=1&wait_for_async_insert=0&async_insert_busy_timeout_ms=100", "( (SELECT v FROM auth_path.secret LIMIT 1) )"),
+            ("sync_expr_control", "input_format_values_interpret_expressions=1&async_insert=0", "(1+2)"),
+            ("async_expr_control", "input_format_values_interpret_expressions=1&async_insert=1&wait_for_async_insert=1&async_insert_busy_timeout_ms=100", "(4+5)"),
+            ("sync_insert_query", "input_format_values_interpret_expressions=1&async_insert=0", "( (SELECT v FROM auth_path.secret LIMIT 1) )"),
+          ]
+          for name,qs,body in options:
+              method="PUT"
+              path="/auth_path/inbox.Values?"+qs
+              status,result=call(path,body,method=method,who="writer")
+              print("ATTEMPT",name,"STATUS",status,"OUTPUT",repr(result[:550]),flush=True)
+              if name in ("sync_expr_control","async_expr_control") and status!=200:
+                  print("NOTE_CONTROL_NOT_200",name,flush=True)
+          time.sleep(2)
+          c,body=sql("SELECT groupArray(v) FROM auth_path.inbox LIMIT 1 SETTINGS max_execution_time=10,max_rows_to_read=100")
+          print("AFTER_ATTEMPTS",c,body,flush=True)
+          if c!=200:raise RuntimeError(body)
+          if "733331" in body:
+              print("SECURITY_CANDIDATE_VALIDATION_REQUIRED: unauthorized SELECT through Values interpretation under another execution context",flush=True)
+              raise AssertionError("Sensitive value was inserted into attacker-controlled sink")
+          print("NO_CROSS_USER_READ: synthetic secret absent from inbox",flush=True)
+          PY
+          python3 /tmp/e2e.py
+      - name: Docker logs on failure
+        if: failure()
+        run: docker logs ch 2>&1 | tail -75
