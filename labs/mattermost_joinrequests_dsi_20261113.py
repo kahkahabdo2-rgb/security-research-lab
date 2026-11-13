@@ -77,10 +77,46 @@ def main():
     expected(st,201,"B in other team")
     st,_,_=request("POST",f"/teams/{t1id}/members",{"team_id":t1id,"user_id":cid},A)
     expected(st,201,"C in team1")
-    st,ch,_=request("POST","/channels",{"team_id":t1id,"name":"jrp"+suffix,"display_name":"Private Discoverable","type":"P","discoverable":True},A)
+    private_header="DSI_PRIVATE_HEADER_"+suffix
+    private_purpose="DSI_PRIVATE_PURPOSE_"+suffix
+    cname="jrp"+suffix
+    st,ch,_=request("POST","/channels",{"team_id":t1id,"name":cname,
+        "display_name":"Private Discoverable","type":"P","discoverable":True,
+        "header":private_header,"purpose":private_purpose},A)
     expected(st,201,"create discoverable private channel")
     chid=ch["id"]
     print("CONFIG "+json.dumps({"channel_discoverable":ch.get("discoverable"),"private":ch.get("type")=="P"}),flush=True)
+    st,adminview,_=request("GET",f"/channels/{chid}",token=A)
+    check("T00_admin_private_metadata_control",st==200 and adminview.get("header")==private_header and adminview.get("purpose")==private_purpose,
+          {"http":st,"header_canary":adminview.get("header")==private_header,"purpose_canary":adminview.get("purpose")==private_purpose},"admin sees own channel metadata")
+    st,from_other_team,_=request("GET",f"/channels/{chid}",token=B)
+    exposed_by_id=st==200 and isinstance(from_other_team,dict) and from_other_team.get("header")==private_header and from_other_team.get("purpose")==private_purpose
+    check("T00_cross_team_private_metadata_direct_id",True,
+          {"http":st,"metadata_exposed":exposed_by_id,
+           "has_props":isinstance(from_other_team,dict) and from_other_team.get("props") is not None},
+          "record cross-team disclosure; metadata_exposed=true is suspicious")
+    st,by_teamid,_=request("GET",f"/teams/{t1id}/channels/name/{cname}",token=B)
+    exposed_by_teamid=st==200 and isinstance(by_teamid,dict) and by_teamid.get("header")==private_header and by_teamid.get("purpose")==private_purpose
+    check("T00_cross_team_private_metadata_by_team_id_and_name",True,
+          {"http":st,"metadata_exposed":exposed_by_teamid},
+          "record exposure without direct channel id")
+    st,by_teamname,_=request("GET",f"/teams/name/jrteam1{suffix}/channels/name/{cname}",token=B)
+    exposed_by_teamname=st==200 and isinstance(by_teamname,dict) and by_teamname.get("header")==private_header and by_teamname.get("purpose")==private_purpose
+    check("T00_cross_team_private_metadata_by_team_name_and_channel_name",True,
+          {"http":st,"metadata_exposed":exposed_by_teamname},
+          "record exposure using guessable names")
+    st,team_nonmember,_=request("GET",f"/channels/{chid}",token=C)
+    check("T00_same_team_nonmember_intended_metadata",st==200 and team_nonmember.get("header")==private_header,
+          {"http":st,"header_canary":isinstance(team_nonmember,dict) and team_nonmember.get("header")==private_header},
+          "same-team member can discover metadata")
+    st,hidden,_=request("POST","/channels",{"team_id":t1id,"name":"jrh"+suffix,
+        "display_name":"Private Hidden","type":"P","discoverable":False,
+        "header":"DSI_HIDDEN_HEADER_"+suffix},A)
+    expected(st,201,"create hidden private negative control")
+    st,hidden_data,_=request("GET",f"/channels/{hidden['id']}",token=B)
+    check("T00_nondiscoverable_cross_team_metadata_denied",st in (403,404),
+          {"http":st,"hidden_header_visible":isinstance(hidden_data,dict) and hidden_data.get("header")=="DSI_HIDDEN_HEADER_"+suffix},
+          "403/404, no metadata")
     st,_,_=request("POST",f"/channels/{chid}/members",{"user_id":cid},A)
     expected(st,201,"C normal private-channel member")
     st,_,_=request("POST",f"/posts",{"channel_id":chid,"message":"PRIVATE_TEST_"+suffix},B)
