@@ -1,0 +1,66 @@
+name: Mattermost 12.0.2 Drafts Boundary Native E2E
+on:
+  push:
+    branches:
+      - research/mattermost-drafts-dsi-20261113
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  drafts-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - name: Checkout isolated test branch
+        uses: actions/checkout@v4
+      - name: Start disposable official Mattermost 12.0.2 and PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name mm-dsi-db --network host \
+            -e POSTGRES_USER=mmuser \
+            -e POSTGRES_PASSWORD=mm_lab_only_password \
+            -e POSTGRES_DB=mattermost \
+            postgres:16-alpine
+          docker run -d --name mm-dsi-app --network host \
+            -e MM_SQLSETTINGS_DRIVERNAME=postgres \
+            -e 'MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:mm_lab_only_password@127.0.0.1:5432/mattermost?sslmode=disable&connect_timeout=10' \
+            -e MM_SERVICESETTINGS_SITEURL=http://127.0.0.1:8065 \
+            -e MM_SERVICESETTINGS_ALLOWSYNCEDDRAFTS=true \
+            -e MM_TEAMSETTINGS_ENABLEOPENSERVER=true \
+            -e MM_EMAILSETTINGS_ENABLESIGNUPWITHEMAIL=true \
+            -e MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION=false \
+            -e MM_LOGSETTINGS_ENABLEFILE=false \
+            mattermost/mattermost-team-edition:12.0.2
+          docker image inspect mattermost/mattermost-team-edition:12.0.2 --format 'OFFICIAL_IMAGE={{.RepoTags}} IMAGE_ID={{.Id}}'
+      - name: Wait for official server readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in $(seq 1 130); do
+            if curl --silent --fail --max-time 3 http://127.0.0.1:8065/api/v4/system/ping >/dev/null; then
+              echo "OFFICIAL_SERVER_READY=YES"
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' mm-dsi-app)" != "true" ]]; then
+              echo "OFFICIAL_SERVER_STOPPED=YES"
+              docker logs mm-dsi-app --tail 80 | sed -E 's#(password|token|secret)=([^[:space:]]+)#\1=[REDACTED]#gi'
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "OFFICIAL_SERVER_READY=NO"
+          docker logs mm-dsi-app --tail 80 | sed -E 's#(password|token|secret)=([^[:space:]]+)#\1=[REDACTED]#gi'
+          exit 1
+      - name: Install small WebSocket test dependency
+        run: python3 -m pip install --quiet websocket-client
+      - name: Run native A-vs-B boundary tests and state-transition controls
+        run: python3 labs/mattermost_drafts_dsi_20261113.py
+      - name: Non-secret diagnostic on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "DOCKER_STATUS"
+          docker ps --format '{{.Names}} {{.Status}}' || true
+          echo "MATTERMOST_ERROR_ONLY"
+          docker logs mm-dsi-app 2>&1 | grep -E 'ERROR|FATAL|panic|WARN' | tail -35 || true
