@@ -1,0 +1,146 @@
+name: ClickHouse Async INSERT Authorization E2E
+on:
+  push:
+    branches: [research-clickhouse-async-trust-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  async-auth:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["clickhouse/clickhouse-server:26.10.3.7", "clickhouse/clickhouse-server:head"]
+    steps:
+      - name: Launch isolated official server
+        env:
+          CH_IMAGE: ${{ matrix.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name ch-async --network host --memory 4g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-pass \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 "$CH_IMAGE"
+          for i in {1..90}; do
+            if curl -fsS --user admin:synthetic-admin-pass "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS --user admin:synthetic-admin-pass "http://127.0.0.1:8123/?query=SELECT%20version()"
+      - name: Run permission and deferred-execution boundary checks
+        shell: bash
+        run: |
+          cat > /tmp/async_auth_test.py <<'PY'
+          import sys,time,base64,urllib.parse,urllib.request,urllib.error
+          BASE="http://127.0.0.1:8123/"
+          results=[]
+          def q(sql, who="admin", pw=None, async_mode=False, method="POST"):
+              if pw is None: pw={"admin":"synthetic-admin-pass","role_writer":"test-role-writer","direct_writer":"test-direct-writer","alice":"test-alice","bob":"test-bob"}.get(who)
+              params={}
+              if async_mode:
+                  params={
+                      "async_insert":"1",
+                      "wait_for_async_insert":"0",
+                      "async_insert_use_adaptive_busy_timeout":"0",
+                      "async_insert_busy_timeout_min_ms":"25000",
+                      "async_insert_busy_timeout_max_ms":"25000",
+                      "async_insert_max_data_size":"100000000",
+                      "async_insert_max_query_number":"1000"}
+              uri=BASE+("?"+urllib.parse.urlencode(params) if params else "")
+              req=urllib.request.Request(uri,data=sql.encode("utf-8"),method=method)
+              req.add_header("Authorization","Basic "+base64.b64encode((who+":"+pw).encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=35) as resp:
+                      return resp.status,resp.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:
+                  return e.code,e.read().decode(errors="replace").strip()
+          def admin(sql):
+              code,msg=q(sql)
+              if code!=200: raise RuntimeError(f"ADMIN_FAIL {code} {sql}: {msg[:280]}")
+              return msg
+          def obs(name,expected,detail):
+              label="PASS" if expected else "INVESTIGATE"
+              print(f"OBS {name}: {label}: {detail}",flush=True)
+              results.append((name,label,str(detail)[:250]))
+          def count(tab,ident=None):
+              cond="" if ident is None else " WHERE id = "+str(ident)
+              return int(admin(f"SELECT count() FROM async_lab.{tab}{cond} LIMIT 1 SETTINGS max_execution_time=10, max_rows_to_read=100000"))
+          def flush():
+              return admin("SYSTEM FLUSH ASYNC INSERT QUEUE")
+          def pending():
+              return admin("SELECT count() FROM system.asynchronous_inserts LIMIT 1 SETTINGS max_execution_time=10, max_rows_to_read=100000")
+          def acl_denial(code,body):
+              return code!=200 and any(x in body.lower() for x in ("not enough privileges","access denied","not granted","access_denied","insufficient"))
+          print("RELEASE_VERSION:",admin("SELECT version()"),flush=True)
+          for sql in [
+              "CREATE DATABASE async_lab",
+              "CREATE TABLE async_lab.role_target (id UInt32, tag String) ENGINE=MergeTree ORDER BY id",
+              "CREATE TABLE async_lab.direct_target (id UInt32, tag String) ENGINE=MergeTree ORDER BY id",
+              "CREATE TABLE async_lab.identity_target (id UInt32, actor String DEFAULT currentUser()) ENGINE=MergeTree ORDER BY id",
+              "CREATE USER role_writer IDENTIFIED WITH plaintext_password BY 'test-role-writer'",
+              "CREATE USER direct_writer IDENTIFIED WITH plaintext_password BY 'test-direct-writer'",
+              "CREATE USER alice IDENTIFIED WITH plaintext_password BY 'test-alice'",
+              "CREATE USER bob IDENTIFIED WITH plaintext_password BY 'test-bob'",
+              "CREATE ROLE async_writer_role",
+              "GRANT INSERT ON async_lab.role_target TO async_writer_role",
+              "GRANT async_writer_role TO role_writer",
+              "SET DEFAULT ROLE async_writer_role TO role_writer",
+              "GRANT INSERT ON async_lab.direct_target TO direct_writer",
+              "GRANT INSERT(id) ON async_lab.identity_target TO alice",
+              "GRANT INSERT(id) ON async_lab.identity_target TO bob",
+          ]:
+              admin(sql)
+          # Positive control: immediate permission and deferred flush are functional.
+          c,b=q("INSERT INTO async_lab.direct_target VALUES (1,'granted_before_flush')",who="direct_writer",async_mode=True)
+          obs("queued_authorized_direct",c==200,(c,b[:180],pending()))
+          flush()
+          obs("positive_direct_flush",count("direct_target",1)==1,f"rows={count('direct_target',1)}")
+          # Freeze the role-based write in queue then revoke its role before background execution.
+          c,b=q("INSERT INTO async_lab.role_target VALUES (111,'queued_before_role_revoke')",who="role_writer",async_mode=True)
+          obs("role_enqueue_granted",c==200,(c,b[:120],pending()))
+          admin("REVOKE async_writer_role FROM role_writer")
+          c,b=q("INSERT INTO async_lab.role_target VALUES (112,'sent_after_role_revoke')",who="role_writer")
+          obs("role_direct_denied_after_revoke",acl_denial(c,b),(c,b[:210]))
+          c,b=q("INSERT INTO async_lab.role_target VALUES (113,'async_sent_after_role_revoke')",who="role_writer",async_mode=True)
+          obs("role_async_denied_after_revoke",acl_denial(c,b),(c,b[:210]))
+          flush()
+          role_pre=count("role_target",111)
+          obs("role_deferred_commit_after_revoke",role_pre==0,f"rows_after_revoke={role_pre}; possibly pre-authorized pending work if 1")
+          obs("role_post_revoke_no_unapproved_write",count("role_target",112)==0 and count("role_target",113)==0,
+              f"rows112={count('role_target',112)}; rows113={count('role_target',113)}")
+          # Compare directly granted permissions against role changes.
+          c,b=q("INSERT INTO async_lab.direct_target VALUES (211,'queued_before_direct_revoke')",who="direct_writer",async_mode=True)
+          obs("direct_enqueue_before_revoke",c==200,(c,b[:120],pending()))
+          admin("REVOKE INSERT ON async_lab.direct_target FROM direct_writer")
+          c,b=q("INSERT INTO async_lab.direct_target VALUES (212,'after_direct_revoke')",who="direct_writer",async_mode=True)
+          obs("direct_revoke_submission_denied",acl_denial(c,b),(c,b[:160]))
+          flush()
+          direct_pre=count("direct_target",211)
+          obs("direct_deferred_commit_after_revoke",direct_pre==0,f"rows_after_revoke={direct_pre}; possibly pre-authorized pending work if 1")
+          obs("direct_post_revoke_no_unapproved_write",count("direct_target",212)==0,f"rows={count('direct_target',212)}")
+          # User separation and currentUser attribution across a shared query shape and flush.
+          c1,b1=q("INSERT INTO async_lab.identity_target (id) VALUES (301)",who="alice",async_mode=True)
+          c2,b2=q("INSERT INTO async_lab.identity_target (id) VALUES (302)",who="bob",async_mode=True)
+          obs("cross_user_queued",c1==200 and c2==200,(c1,b1[:80],c2,b2[:80],pending()))
+          # Neither user can flush the global queue without the SYSTEM privilege.
+          c3,b3=q("SYSTEM FLUSH ASYNC INSERT QUEUE",who="alice")
+          obs("unprivileged_global_flush_denied",acl_denial(c3,b3),(c3,b3[:210]))
+          flush()
+          rows=admin("SELECT id, actor FROM async_lab.identity_target ORDER BY id LIMIT 10 SETTINGS max_execution_time=10, max_rows_to_read=100000")
+          obs("cross_user_identity_attribution",rows.splitlines()==["301\talice","302\tbob"],repr(rows))
+          # Rejected users must not piggyback on other users' already queued insert for the same target.
+          c,b=q("INSERT INTO async_lab.identity_target (id) VALUES (303)",who="direct_writer",async_mode=True)
+          obs("unauthorized_identity_enqueue_denied",acl_denial(c,b),(c,b[:210]))
+          flush()
+          obs("unauthorized_identity_no_committed_rows",count("identity_target",303)==0,f"rows={count('identity_target',303)}")
+          print("END_RESULTS:",results,flush=True)
+          # Distinguish a likely finding from an E2E experiment with a by-design interpretation.
+          core=[r for r in results if r[0] not in ("role_deferred_commit_after_revoke","direct_deferred_commit_after_revoke")]
+          if any(r[1]!="PASS" for r in core): sys.exit(2)
+          print("DEFERRED_COMMIT_ROLE",role_pre,"DEFERRED_COMMIT_DIRECT",direct_pre,flush=True)
+          PY
+          python /tmp/async_auth_test.py
+      - name: Capture server logs on test failure
+        if: failure()
+        run: docker logs --tail 100 ch-async 2>&1 | tail -100
