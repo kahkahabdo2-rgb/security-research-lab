@@ -140,6 +140,83 @@ jobs:
           print('OFFICIAL_UNMODIFIED_TELETRAAN_HTTP_E2E_PROVEN=TRUE')
           print('NOTE: This isolated test uses stock open auth, not a constrained WRITE principal.')
           PY
+      - name: Check original role authorization and surviving service audit log
+        run: |
+          kill "$(cat /tmp/teletraan-native.pid)"
+          sleep 2
+          cat > /tmp/identity_provider_lab.py <<'PY'
+          import json
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from urllib.parse import urlparse, parse_qs
+          class H(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  users={'writer-token':'writer-lab','reader-token':'reader-lab'}
+                  user=users.get(parse_qs(urlparse(self.path).query).get('access_token',[''])[0])
+                  if not user:
+                      self.send_response(401)
+                      self.end_headers()
+                      return
+                  body=json.dumps({'user':{'username':user}}).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type','application/json')
+                  self.send_header('Content-Length',str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self,*args):
+                  pass
+          HTTPServer(('127.0.0.1',9090),H).serve_forever()
+          PY
+          python3 /tmp/identity_provider_lab.py > /tmp/idp.log 2>&1 &
+          docker exec --env MYSQL_PWD=lab-only-password teletraan-native-mysql mysql -uroot deploy <<'SQL'
+          INSERT INTO users_and_roles(user_name,resource_id,resource_type,role) VALUES
+          ('writer-lab','auditlab','ENV','WRITE'),
+          ('writer-lab','*','SYSTEM','READ'),
+          ('reader-lab','*','SYSTEM','READ');
+          INSERT INTO environs (env_id,env_name,stage_name,env_state,max_parallel,priority,stuck_th,success_th,last_operator,last_update,accept_type,max_deploy_num,max_deploy_day,state,override_policy)
+          VALUES ('labotherenv000000001','otherlab','dev','NORMAL',1,'NORMAL',30,50,'lab',1,'AUTO',2,2,'NORMAL','WARN');
+          SQL
+          cat >> upstream/deploy-service/teletraanservice/bin/server.yaml <<'YAML'
+          authentication:
+            type: token
+            userDataUrl: http://127.0.0.1:9090
+          authorization:
+            type: role
+          YAML
+          java -Xmx640m -cp 'upstream/deploy-service/teletraanservice/target/classes:upstream/deploy-service/teletraanservice/target/lib/*:upstream/deploy-service/common/target/classes:upstream/deploy-service/universal/target/classes' com.pinterest.teletraan.TeletraanService server upstream/deploy-service/teletraanservice/bin/server.yaml > /tmp/teletraan-role.log 2>&1 &
+          echo $! > /tmp/teletraan-role.pid
+          python3 - <<'PY'
+          import json, time, subprocess, urllib.request, urllib.error
+          root='http://127.0.0.1:8080/v1/envs/'
+          def fetch(env,method='GET',token='writer-token',data=None):
+              u=root+env+'/dev/script_configs'
+              req=urllib.request.Request(u,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},data=json.dumps(data).encode() if data is not None else None)
+              try:
+                  with urllib.request.urlopen(req,timeout=10) as r:
+                      raw=r.read()
+                      return r.status, json.loads(raw) if raw else None
+              except urllib.error.HTTPError as e:
+                  return e.code,None
+          for _ in range(60):
+              s,_=fetch('auditlab')
+              if s in (200,403):break
+              time.sleep(2)
+          print('READER_WRITE_STATUS=',fetch('auditlab','PUT','reader-token',{'CONTROL':'reject'})[0])
+          print('CROSS_ENV_WRITE_STATUS=',fetch('otherlab','PUT','writer-token',{'CONTROL':'reject'})[0])
+          s,_=fetch('auditlab','PUT','writer-token',{'ROLE_CONTROL':'small'})
+          print('WRITER_SMALL_PUT_STATUS=',s)
+          assert s==204,s
+          s,_=fetch('auditlab','PUT','writer-token',{'AUDIT_ROLE_CANARY':'Z'*9000})
+          print('WRITER_LARGE_PUT_STATUS=',s)
+          assert s==204,s
+          s,data=fetch('auditlab')
+          assert s==200 and len(data['AUDIT_ROLE_CANARY'])==9000,(s,data)
+          def sql(q):
+              return subprocess.check_output(['docker','exec','--env','MYSQL_PWD=lab-only-password','teletraan-native-mysql','mysql','-uroot','-N','-B','deploy','-e',q],text=True).strip()
+          assert int(sql("SELECT COUNT(*) FROM config_history WHERE config_id='labauditenv000000001'"))==2
+          assert 'AUDIT_ROLE_CANARY' in open('/tmp/teletraan-role.log').read()
+          print('ROLE_SCOPED_LARGE_UPDATE_PERSISTED_AND_CONFIG_HISTORY_OMITTED=TRUE')
+          print('SERVICE_LOG_STILL_CONTAINS_CANARY=TRUE')
+          PY
       - name: Debug logs on failure only
         if: failure()
         run: |
