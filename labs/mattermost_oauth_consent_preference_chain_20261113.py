@@ -69,6 +69,14 @@ def main():
     victim_name,victim_id=users[1]
     owner_token=login(owner_name,pw)
     normal_token=login(victim_name,pw)
+    st,ordinary_me,_=request("GET","/api/v4/users/me",token=normal_token)
+    roles=ordinary_me.get("roles","").split()
+    check("A00_victim_is_ordinary_nonadmin",
+          st==200 and "system_user" in roles and "system_admin" not in roles,
+          {"status":st,"ordinary_user":("system_user" in roles),
+           "no_system_admin_role":("system_admin" not in roles)},
+          "authenticated ordinary system_user without system_admin")
+    if st!=200 or "system_admin" in roles:raise RuntimeError("Actor boundary not ordinary user")
     sf=secrets.token_hex(5)
     st,team,_=request("POST","/api/v4/teams",{"name":"labvault"+sf,"display_name":"OAuth Consent Lab","type":"O"},owner_token)
     if st!=201:
