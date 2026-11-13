@@ -1,0 +1,55 @@
+name: Mattermost OAuth Cross-Feature Consent Preference Chain E2E
+on:
+  push:
+    branches:
+      - research/mattermost-oauth-consent-preference-chain-20261113
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  consent-chain:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unmodified official Mattermost and isolated throwaway DB
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name mm-consent-db --network host \
+            -e POSTGRES_USER=mmuser -e POSTGRES_PASSWORD=mm_lab_only_password \
+            -e POSTGRES_DB=mattermost postgres:16-alpine
+          docker run -d --name mm-consent-app --network host \
+            -e MM_SQLSETTINGS_DRIVERNAME=postgres \
+            -e 'MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:mm_lab_only_password@127.0.0.1:5432/mattermost?sslmode=disable&connect_timeout=10' \
+            -e MM_SERVICESETTINGS_SITEURL=http://127.0.0.1:8065 \
+            -e MM_SERVICESETTINGS_ENABLEOAUTHSERVICEPROVIDER=true \
+            -e MM_SERVICESETTINGS_ENABLEDYNAMICCLIENTREGISTRATION=true \
+            -e MM_SERVICESETTINGS_DCRREDIRECTURIALLOWLIST=https://approved.example.invalid/cb \
+            -e MM_TEAMSETTINGS_ENABLEOPENSERVER=true \
+            -e MM_EMAILSETTINGS_ENABLESIGNUPWITHEMAIL=true \
+            -e MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION=false \
+            -e MM_LOGSETTINGS_ENABLEFILE=false \
+            mattermost/mattermost-team-edition:12.0.2
+          docker image inspect mattermost/mattermost-team-edition:12.0.2 --format 'OFFICIAL_IMAGE={{.RepoTags}} IMAGE_ID={{.Id}}'
+      - name: Wait for official app HTTP
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 120); do
+            if curl --silent --fail --max-time 3 http://127.0.0.1:8065/api/v4/system/ping >/dev/null; then
+              echo SERVER_READY=YES
+              exit 0
+            fi
+            sleep 5
+          done
+          echo SERVER_READY=NO
+          docker logs mm-consent-app --tail 45 | grep -E 'ERROR|FATAL|panic' || true
+          exit 1
+      - name: Cross-feature attack with 14 positive and negative controls
+        run: python3 labs/mattermost_oauth_consent_preference_chain_20261113.py
+      - name: Redacted diagnostic on failure
+        if: failure()
+        run: |
+          docker ps --format '{{.Names}} {{.Status}}' || true
+          docker logs mm-consent-app 2>&1 | grep -E 'ERROR|FATAL|panic' | tail -20 || true
