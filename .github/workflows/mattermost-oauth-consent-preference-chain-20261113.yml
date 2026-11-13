@@ -46,7 +46,7 @@ jobs:
           echo SERVER_READY=NO
           docker logs mm-consent-app --tail 45 | grep -E 'ERROR|FATAL|panic' || true
           exit 1
-      - name: Cross-feature attack with 14 positive and negative controls
+      - name: Cross-feature attacker session chaining, consent bypass and post-revocation private access
         run: python3 labs/mattermost_oauth_consent_preference_chain_20261113.py
       - name: Redacted diagnostic on failure
         if: failure()
