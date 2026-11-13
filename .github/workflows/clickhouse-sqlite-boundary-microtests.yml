@@ -116,6 +116,31 @@ jobs:
             echo 'URI_ATTEMPT_REJECTED:'; cat /tmp/uri.log
             blocked 'URI-looking filename rejected; no path-escape claim'
           fi
+          # Attempt to bypass filesystem policy with URI prefixes that avoid the '?' glob wildcard.
+          docker exec -u root "$NAME" sh -c \
+            "mkdir -p '/var/lib/clickhouse/user_files/file:%2e%2e' '/var/lib/clickhouse/user_files/file:/var/lib/clickhouse'; printf 'SENTINEL_TWO' > /var/lib/clickhouse/outside2.sqlite; printf 'SENTINEL_THREE' > /var/lib/clickhouse/outside3.sqlite; printf 'SENTINEL_FOUR' > /var/lib/clickhouse/outside4.sqlite; chown -R clickhouse:clickhouse /var/lib/clickhouse/user_files; chown clickhouse:clickhouse /var/lib/clickhouse/outside2.sqlite /var/lib/clickhouse/outside3.sqlite /var/lib/clickhouse/outside4.sqlite"
+          for uri_name in 'file:../outside2.sqlite' 'file:%2e%2e/outside3.sqlite' 'file:/var/lib/clickhouse/outside4.sqlite'; do
+            echo "URI_NO_QUERY_ATTEMPT=$uri_name"
+            if ch writer WriterTestPass123 "INSERT INTO TABLE FUNCTION file('$uri_name', 'SQLite', 'v UInt64') VALUES (13)" >/tmp/uri-noquery.log 2>&1; then
+              pass "server accepted URI-looking filename: $uri_name"
+            else
+              echo 'URI_NO_QUERY_REJECTED:'; cat /tmp/uri-noquery.log
+              blocked "URI-looking filename rejected: $uri_name"
+            fi
+          done
+          for label in two three four; do
+            case "$label" in
+              two) path_to_check='/var/lib/clickhouse/outside2.sqlite'; expected='SENTINEL_TWO' ;;
+              three) path_to_check='/var/lib/clickhouse/outside3.sqlite'; expected='SENTINEL_THREE' ;;
+              four) path_to_check='/var/lib/clickhouse/outside4.sqlite'; expected='SENTINEL_FOUR' ;;
+            esac
+            docker cp "$NAME:$path_to_check" "/tmp/$label-after"
+            if [ "$(cat "/tmp/$label-after")" = "$expected" ]; then
+              pass "outside sentinel $label unchanged after URI interpretation attempt"
+            else
+              fail "outside sentinel $label CHANGED after URI interpretation attempt"
+            fi
+          done
           docker cp "$NAME:/var/lib/clickhouse/outside.sqlite" /tmp/outside-after.sqlite
           if [ "$(cat /tmp/outside-after.sqlite)" = "SYNTHETIC_SENTINEL" ]; then
             pass 'sensitive boundary: outside sentinel unchanged after URI experiment'
