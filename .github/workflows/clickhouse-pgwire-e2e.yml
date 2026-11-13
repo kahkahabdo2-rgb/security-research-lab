@@ -1,0 +1,154 @@
+name: ClickHouse PostgreSQL wire trust-boundary E2E
+on:
+  push:
+    branches: [research-clickhouse-pgwire-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Start unmodified official ClickHouse release
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/ch-pgwire.xml <<'XML'
+          <clickhouse>
+            <listen_host>127.0.0.1</listen_host>
+            <postgresql_port>9005</postgresql_port>
+          </clickhouse>
+          XML
+          docker run -d --name ch-pgwire --network host --memory 4g             --ulimit nofile=262144:262144             -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=test-admin-pass             -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1             -v /tmp/ch-pgwire.xml:/etc/clickhouse-server/config.d/pgwire.xml:ro             clickhouse/clickhouse-server:26.10.3.7
+          for i in {1..90}; do
+            if curl -fsS --user 'admin:test-admin-pass' 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS --user 'admin:test-admin-pass' 'http://127.0.0.1:8123/?query=SELECT%20version()'
+          docker ps --filter name=ch-pgwire
+      - name: Setup isolated lab roles and data
+        shell: bash
+        run: |
+          set -euo pipefail
+          chq() { curl --fail --silent --show-error --user 'admin:test-admin-pass' --data-binary "$1" http://127.0.0.1:8123/; }
+          chq "CREATE DATABASE IF NOT EXISTS pgwire_e2e"
+          chq "CREATE TABLE pgwire_e2e.vault (id UInt32, secret String) ENGINE=MergeTree ORDER BY id"
+          chq "CREATE TABLE pgwire_e2e.incoming (id UInt32) ENGINE=MergeTree ORDER BY id"
+          chq "INSERT INTO pgwire_e2e.vault VALUES (1, 'SYNTHETIC_PG_WIRE_CANARY')"
+          chq "CREATE USER pg_low IDENTIFIED WITH plaintext_password BY 'low-test-pass'"
+          chq "GRANT SELECT ON pgwire_e2e.vault TO pg_low"
+          python -m pip -q install 'psycopg[binary]>=3.2,<3.3' 'psycopg2-binary>=2.9,<2.10'
+      - name: Execute adversarial E2E and negative controls
+        shell: bash
+        run: |
+          cat > /tmp/pgwire_e2e.py <<'PY'
+          import io, re, urllib.request, base64, sys
+          import psycopg2
+          import psycopg
+
+          dsn = "host=127.0.0.1 port=9005 dbname=default user=pg_low password=low-test-pass sslmode=disable connect_timeout=8"
+          results = []
+          def admin(sql):
+              req = urllib.request.Request("http://127.0.0.1:8123/", sql.encode(), method="POST")
+              req.add_header("Authorization", "Basic " + base64.b64encode(b"admin:test-admin-pass").decode())
+              with urllib.request.urlopen(req, timeout=12) as response:
+                  return response.read().decode().strip()
+          def outcome(name, status, detail):
+              results.append((name, status, str(detail)[:280]))
+              print(f"{name}: {status}: {detail}", flush=True)
+          def is_deny(err):
+              s = str(err).lower()
+              return any(x in s for x in ("access_denied", "not enough privileges", "permission denied", "not granted", "insufficient_privilege"))
+          def pg():
+              return psycopg2.connect(dsn)
+
+          print("TEST_VERSION:", admin("SELECT version()"), flush=True)
+          # Baseline: the same low-privilege PostgreSQL session CAN read while SELECT is granted.
+          c2 = pg()
+          c2.autocommit = True
+          with c2.cursor() as cur:
+              cur.execute("SELECT secret FROM pgwire_e2e.vault WHERE id=1")
+              val = cur.fetchone()[0]
+          outcome("baseline_granted_select", "PASS" if val == "SYNTHETIC_PG_WIRE_CANARY" else "INCONCLUSIVE", val)
+
+          # Prepare with SELECT granted, then revoke during the same live session; execute again.
+          extended = None
+          try:
+              extended = psycopg.connect(dsn, autocommit=True, prepare_threshold=0)
+              value = extended.execute("SELECT secret FROM pgwire_e2e.vault WHERE id = %s", ("1",), prepare=True).fetchone()[0]
+              outcome("extended_prepare_before_revoke", "PASS" if value == "SYNTHETIC_PG_WIRE_CANARY" else "INCONCLUSIVE", value)
+          except Exception as e:
+              outcome("extended_prepare_before_revoke", "INCONCLUSIVE", repr(e))
+              if extended is not None:
+                  extended.close()
+              extended = None
+
+          admin("REVOKE SELECT ON pgwire_e2e.vault FROM pg_low")
+          try:
+              with c2.cursor() as cur:
+                  cur.execute("SELECT secret FROM pgwire_e2e.vault WHERE id=1")
+                  rows = cur.fetchall()
+              outcome("same_session_direct_after_revoke", "BYPASS", rows)
+          except Exception as e:
+              outcome("same_session_direct_after_revoke", "PASS_DENIED" if is_deny(e) else "INCONCLUSIVE", repr(e))
+          if extended is not None:
+              try:
+                  rows = extended.execute("SELECT secret FROM pgwire_e2e.vault WHERE id = %s", ("1",), prepare=True).fetchall()
+                  outcome("extended_execute_after_revoke", "BYPASS", rows)
+              except Exception as e:
+                  outcome("extended_execute_after_revoke", "PASS_DENIED" if is_deny(e) else "INCONCLUSIVE", repr(e))
+              finally:
+                  extended.close()
+          c2.close()
+
+          # Independent PostgreSQL COPY path, with column-level SELECT restriction.
+          admin("GRANT SELECT(id) ON pgwire_e2e.vault TO pg_low")
+          try:
+              with pg() as conn, conn.cursor() as cur:
+                  out = io.StringIO()
+                  cur.copy_expert("COPY (SELECT id FROM pgwire_e2e.vault) TO STDOUT WITH (FORMAT CSV)", out)
+                  outcome("copy_allowed_column_positive", "PASS" if "1" in out.getvalue() else "INCONCLUSIVE", repr(out.getvalue()[:70]))
+          except Exception as e:
+              outcome("copy_allowed_column_positive", "INCONCLUSIVE", repr(e))
+          for name, query in [
+              ("copy_secret_subquery", "COPY (SELECT secret FROM pgwire_e2e.vault) TO STDOUT WITH (FORMAT CSV)"),
+              ("copy_secret_table", "COPY pgwire_e2e.vault TO STDOUT WITH (FORMAT CSV)")]:
+              try:
+                  with pg() as conn, conn.cursor() as cur:
+                      out = io.StringIO()
+                      cur.copy_expert(query, out)
+                      outcome(name, "BYPASS" if "SYNTHETIC_PG_WIRE_CANARY" in out.getvalue() else "INCONCLUSIVE", repr(out.getvalue()[:100]))
+              except Exception as e:
+                  outcome(name, "PASS_DENIED" if is_deny(e) else "INCONCLUSIVE", repr(e))
+
+          # COPY FROM must not bypass INSERT grant, even with column-level SELECT elsewhere.
+          try:
+              with pg() as conn, conn.cursor() as cur:
+                  cur.copy_expert("COPY pgwire_e2e.incoming FROM STDIN", io.StringIO("991\n"))
+              outcome("copy_without_insert_grant", "BYPASS", admin("SELECT count() FROM pgwire_e2e.incoming"))
+          except Exception as e:
+              outcome("copy_without_insert_grant", "PASS_DENIED" if is_deny(e) else "INCONCLUSIVE", repr(e))
+
+          # Once INSERT is permitted, a syntactically bad second row must never partially commit the first.
+          admin("GRANT INSERT ON pgwire_e2e.incoming TO pg_low")
+          try:
+              with pg() as conn, conn.cursor() as cur:
+                  cur.copy_expert("COPY pgwire_e2e.incoming FROM STDIN", io.StringIO("992\nnot_an_integer\n"))
+              outcome("copy_partial_commit_error", "BYPASS", "server accepted malformed row")
+          except Exception as e:
+              count = admin("SELECT count() FROM pgwire_e2e.incoming")
+              outcome("copy_partial_commit_error", "PASS_NO_PARTIAL_WRITE" if count == "0" else "BYPASS", f"rows_after={count}; error={repr(e)[:160]}")
+          count = admin("SELECT count() FROM pgwire_e2e.incoming")
+          outcome("final_table_integrity", "PASS" if count == "0" else "BYPASS", f"rows={count}")
+          print("SUMMARY:", results, flush=True)
+          if any(s == "BYPASS" for _, s, _ in results):
+              print("SECURITY_BOUNDARY_VIOLATION_CANDIDATE: needs independent verification", flush=True)
+              sys.exit(2)
+          if any(s == "INCONCLUSIVE" for _, s, _ in results):
+              sys.exit(3)
+          PY
+          python /tmp/pgwire_e2e.py
+      - name: Print server logs on failure
+        if: failure()
+        run: docker logs --tail 160 ch-pgwire 2>&1 | tail -160
