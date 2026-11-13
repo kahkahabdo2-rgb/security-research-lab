@@ -39,8 +39,14 @@ def login(username,password):
 
 def has_message(token,team,message):
     code,body,_=call("GET",f"/users/me/teams/{team}/drafts",token=token)
-    if code != 200 or not isinstance(body,list):
-        raise RuntimeError("GET own drafts failed "+str(code))
+    if code != 200:
+        raise RuntimeError("GET own drafts failed HTTP "+str(code))
+    # A server may encode the empty list as JSON null; keep the control observable.
+    if body is None:
+        print("DRAFT_LIST_DIAGNOSTIC "+json.dumps({"http":code,"shape":"null"}),flush=True)
+        body=[]
+    if not isinstance(body,list):
+        raise RuntimeError("GET own drafts unexpected JSON type "+type(body).__name__)
     return any(x.get("message")==message for x in body), body
 
 def ws_auth(token):
@@ -147,7 +153,7 @@ def main():
         still,_=has_message(at,tid,reply_canary)
         if not still: absent=True;break
         time.sleep(.3)
-    control,_=has_message(at,tid,shared_canary)
+    control,_=has_message(at,tid,ws_canary)
     probe("T09_author_deletes_own_root_affects_other_draft",
       {"A_reply_preexisting":pre,"A_reply_removed":absent,"unrelated_A_draft_preserved":control},
       "record behavior, not automatically a vulnerability",pre and control,
