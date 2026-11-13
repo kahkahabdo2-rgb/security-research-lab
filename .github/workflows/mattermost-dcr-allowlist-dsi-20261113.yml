@@ -26,7 +26,7 @@ jobs:
           args=()
           if [[ "${{ matrix.mode }}" == strict ]]; then
             args+=("-e" "MM_SERVICESETTINGS_ENABLEDYNAMICCLIENTREGISTRATION=true")
-            args+=("-e" 'MM_SERVICESETTINGS_DCREDIRECTURIALLOWLIST=["https://approved.example.invalid/cb"]')
+            args+=("-e" 'MM_SERVICESETTINGS_DCREDIRECTURIALLOWLIST=https://approved.example.invalid/cb')
           else
             args+=("-e" "MM_SERVICESETTINGS_ENABLEDYNAMICCLIENTREGISTRATION=false")
           fi
