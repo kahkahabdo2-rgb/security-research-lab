@@ -123,6 +123,17 @@ jobs:
           c1,b1=q("INSERT INTO async_lab.identity_target (id) VALUES (301)",who="alice",async_mode=True)
           c2,b2=q("INSERT INTO async_lab.identity_target (id) VALUES (302)",who="bob",async_mode=True)
           obs("cross_user_queued",c1==200 and c2==200,(c1,b1[:80],c2,b2[:80],pending()))
+          # Cross-user queue introspection must not disclose other submitters' pending statements.
+          admin("GRANT SELECT ON system.asynchronous_inserts TO alice")
+          admin("GRANT SELECT ON system.asynchronous_inserts TO bob")
+          c_alice,a_rows=q("SELECT count() FROM system.asynchronous_inserts LIMIT 1 SETTINGS max_execution_time=10, max_rows_to_read=100000",who="alice")
+          c_bob,b_rows=q("SELECT count() FROM system.asynchronous_inserts LIMIT 1 SETTINGS max_execution_time=10, max_rows_to_read=100000",who="bob")
+          obs("async_queue_user_visibility",c_alice==200 and c_bob==200 and a_rows=="1" and b_rows=="1",
+              f"alice={c_alice}:{a_rows[:120]}; bob={c_bob}:{b_rows[:120]}; admin={pending()}")
+          # A low user cannot request another user's query text.
+          c_other,other_rows=q("SELECT query FROM system.asynchronous_inserts LIMIT 5 SETTINGS max_execution_time=10, max_rows_to_read=100000",who="bob")
+          obs("async_queue_query_isolation",c_other==200 and "301" not in other_rows,
+              f"bob_code={c_other}; bob_view={other_rows[:210]}")
           # Neither user can flush the global queue without the SYSTEM privilege.
           c3,b3=q("SYSTEM FLUSH ASYNC INSERT QUEUE",who="alice")
           obs("unprivileged_global_flush_denied",acl_denial(c3,b3),(c3,b3[:210]))
