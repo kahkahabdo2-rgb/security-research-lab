@@ -128,6 +128,27 @@ jobs:
               blocked "URI-looking filename rejected: $uri_name"
             fi
           done
+          # Confirm where SQLite really wrote, rather than checking only untouched outside sentinels.
+          for relative_path in \
+            'file:../outside2.sqlite' \
+            'file:%2e%2e/outside3.sqlite' \
+            'file:/var/lib/clickhouse/outside4.sqlite'; do
+            absolute_path="/var/lib/clickhouse/user_files/$relative_path"
+            if docker exec "$NAME" test -f "$absolute_path"; then
+              echo "SAFE_ROOT_OUTPUT_EXISTS=$absolute_path"
+              safe_name=$(basename "$relative_path")
+              docker cp "$NAME:$absolute_path" "/tmp/safe-$safe_name"
+              python3 - "/tmp/safe-$safe_name" <<'PY'
+          import sqlite3,sys
+          cx=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True)
+          row=cx.execute('SELECT * FROM "table"').fetchone()
+          assert row in ((13,), ('13',)), row
+          print('PASS: URI-style output is a readable SQLite database INSIDE user_files:',sys.argv[1])
+          PY
+            else
+              fail "URI-style write not found under user_files: $relative_path"
+            fi
+          done
           for label in two three four; do
             case "$label" in
               two) path_to_check='/var/lib/clickhouse/outside2.sqlite'; expected='SENTINEL_TWO' ;;
