@@ -1,0 +1,96 @@
+name: ClickHouse PostgreSQL Row Policy and Bind E2E
+on:
+  push:
+    branches: [research-clickhouse-pgwire-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  policy-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['clickhouse/clickhouse-server:26.10.3.7', 'clickhouse/clickhouse-server:head']
+    steps:
+      - name: Start stock release with isolated PG interface
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/ch-pg.xml <<'XML'
+          <clickhouse><listen_host>127.0.0.1</listen_host><postgresql_port>9005</postgresql_port></clickhouse>
+          XML
+          docker run -d --name ch --network host --memory 4g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=lab-admin \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -v /tmp/ch-pg.xml:/etc/clickhouse-server/config.d/pgwire.xml:ro "$IMAGE"
+          for i in {1..100}; do
+            curl -fsS --user admin:lab-admin 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null && break
+            sleep 2
+          done
+          curl -fsS --user admin:lab-admin 'http://127.0.0.1:8123/?query=SELECT%20version()'
+          python -m pip -q install 'psycopg[binary]>=3.2,<3.3' 'psycopg2-binary>=2.9,<2.10'
+      - name: Test current row policy across simple COPY and extended Bind
+        run: |
+          cat > /tmp/policy_e2e.py <<'PY'
+          import sys,io,re,base64,urllib.request
+          import psycopg, psycopg2
+          def admin(query):
+              req=urllib.request.Request("http://127.0.0.1:8123/",query.encode(),method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode(b"admin:lab-admin").decode())
+              with urllib.request.urlopen(req,timeout=15) as f: return f.read().decode().strip()
+          def setup(sql): print("SETUP:",sql,admin(sql),flush=True)
+          def result(name,good,detail):
+              label="PASS" if good else "BYPASS"
+              print(f"RESULT {name}: {label}; {detail}",flush=True)
+              return bool(good)
+          setup("CREATE DATABASE pgwire_authz")
+          setup("CREATE TABLE pgwire_authz.policy_rows (id UInt32, secret String) ENGINE=MergeTree ORDER BY id")
+          setup("INSERT INTO pgwire_authz.policy_rows VALUES (1,'PUBLIC_CANARY'),(2,'PRIVATE_CANARY')")
+          setup("CREATE TABLE pgwire_authz.bind_rows (id UInt32, scope String) ENGINE=MergeTree ORDER BY id")
+          setup("INSERT INTO pgwire_authz.bind_rows VALUES (1,'public'),(2,'private')")
+          setup("CREATE USER pg_low IDENTIFIED WITH plaintext_password BY 'pw-low'")
+          setup("GRANT SELECT ON pgwire_authz.policy_rows TO pg_low")
+          setup("GRANT SELECT ON pgwire_authz.bind_rows TO pg_low")
+          setup("CREATE ROW POLICY pgwire_low_policy ON pgwire_authz.policy_rows FOR SELECT USING id = 1 TO pg_low")
+          dsn="host=127.0.0.1 port=9005 dbname=default user=pg_low password=pw-low sslmode=disable connect_timeout=8"
+          good=[]
+          conn=psycopg.connect(dsn,autocommit=True,prepare_threshold=0)
+          query="SELECT id, secret FROM pgwire_authz.policy_rows WHERE id IN (1,2) ORDER BY id"
+          before=conn.execute(query,prepare=True).fetchall()
+          good.append(result("policy_extended_initial",before==[(1,"PUBLIC_CANARY")],repr(before)))
+          conn2=psycopg2.connect(dsn)
+          conn2.autocommit=True
+          def copy_rows(sql):
+              with conn2.cursor() as cur:
+                  out=io.StringIO()
+                  cur.copy_expert(sql,out)
+                  return out.getvalue()
+          s=copy_rows("COPY (SELECT id, secret FROM pgwire_authz.policy_rows ORDER BY id) TO STDOUT WITH (FORMAT CSV)")
+          good.append(result("policy_copy_initial","PUBLIC_CANARY" in s and "PRIVATE_CANARY" not in s,repr(s)))
+          setup("ALTER ROW POLICY pgwire_low_policy ON pgwire_authz.policy_rows FOR SELECT USING id = 2 TO pg_low")
+          direct=conn2.cursor()
+          direct.execute(query)
+          rows=direct.fetchall()
+          good.append(result("policy_simple_after_change",rows==[(2,"PRIVATE_CANARY")],repr(rows)))
+          after=conn.execute(query,prepare=True).fetchall()
+          good.append(result("policy_extended_after_change",after==[(2,"PRIVATE_CANARY")],repr(after)))
+          s=copy_rows("COPY (SELECT id, secret FROM pgwire_authz.policy_rows ORDER BY id) TO STDOUT WITH (FORMAT CSV)")
+          good.append(result("policy_copy_after_change","PRIVATE_CANARY" in s and "PUBLIC_CANARY" not in s,repr(s)))
+          q="SELECT id FROM pgwire_authz.bind_rows WHERE scope = %s ORDER BY id"
+          p_good=conn.execute(q,("public",),prepare=True).fetchall()
+          good.append(result("bind_control",p_good==[(1,)],repr(p_good)))
+          injection="public' OR 1=1 --"
+          p_attack=conn.execute(q,(injection,),prepare=True).fetchall()
+          good.append(result("bind_quote_escape",p_attack==[],repr(p_attack)))
+          conn.close()
+          conn2.close()
+          print("FINAL_COUNTS:",sum(good),"/",len(good),flush=True)
+          if not all(good): sys.exit(2)
+          PY
+          python /tmp/policy_e2e.py
+      - name: Logs on failure
+        if: failure()
+        run: docker logs --tail 120 ch | tail -120
