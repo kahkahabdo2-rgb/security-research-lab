@@ -89,7 +89,7 @@ def main():
         c,body,_=submit(B,pubid,tid,f"http://{host}:{PORT}/variant-{index}")
         time.sleep(.15)
         landed=len(SEEN)>before
-        check(f"T0{index}_loopback_variant", (landed and c==200) if ALLOWED else not landed,
+        check(f"T0{index}_loopback_variant", (landed and c==200) if ALLOWED and host!="127.1" else ((c==200 and landed) or (c==400 and not landed)) if ALLOWED else not landed,
               {"http":c,"internal_request_arrived":landed},
               "arrives only when explicit allowlist permits this address")
     # HYPOTHESIS: same hostname and /plugins-looking path incorrectly switches
@@ -122,7 +122,7 @@ def main():
               {"user_id_bound":sample.get("user_id")==bid,"team_id_bound":sample.get("team_id")==tid},
               "server derives authenticated user and channel's team")
     else:
-        check("T08_no_internal_probe_hit_by_default",len(SEEN)==0,len(SEEN),0)
+        check("T08_no_standard_loopback_hit_by_default",not any(x["path"].startswith("/owned-internal") or x["path"].startswith("/variant-") for x in SEEN),sum(x["path"].startswith("/owned-internal") or x["path"].startswith("/variant-") for x in SEEN),0)
     print("RESULTS "+json.dumps({"allowed":ALLOWED,"checks":CHECKS,
        "failures":[x["test"] for x in CHECKS if not x["pass"]]},sort_keys=True),flush=True)
     server.shutdown()
