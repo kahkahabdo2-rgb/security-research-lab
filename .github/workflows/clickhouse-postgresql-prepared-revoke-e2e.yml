@@ -1,0 +1,107 @@
+name: PostgreSQL Parse Bind Execute privilege-revocation E2E
+on:
+  push:
+    branches: [research-clickhouse-pg-prepared-rbac-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  revocation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [26.10.3.7, head]
+    steps:
+      - name: Start official ClickHouse PostgreSQL protocol
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat >/tmp/pg_port.xml <<'XML'
+          <clickhouse><postgresql_port>9005</postgresql_port></clickhouse>
+          XML
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -v /tmp/pg_port.xml:/etc/clickhouse-server/config.d/pg_port.xml:ro \
+            clickhouse/clickhouse-server:${{ matrix.tag }}
+          for i in {1..95}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+          python3 -m pip install --user 'psycopg[binary]==3.2.10'
+      - name: Test SQL PREPARE and PG extended prepared cross revocation
+        shell: bash
+        run: |
+          cat >/tmp/pg.py <<'PY'
+          import urllib.request, urllib.error,base64
+          import psycopg
+          def http(sql,u='admin'):
+              req=urllib.request.Request('http://127.0.0.1:8123/',data=sql.encode(),method='POST')
+              req.add_header('Authorization','Basic '+base64.b64encode(f'{u}:synthetic-admin-password'.encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=20) as r:return r.status,r.read().decode(errors='replace').strip()
+              except urllib.error.HTTPError as e:return e.code,e.read().decode(errors='replace').strip()
+          def must(sql):
+              code,body=http(sql)
+              print('SETUP',repr(sql),code,repr(body[:280]),flush=True)
+              if code!=200:raise AssertionError('SETUP_FAILED')
+          must('CREATE DATABASE pg_boundary')
+          must('CREATE TABLE pg_boundary.secret (id UInt64, note String) ENGINE=MergeTree ORDER BY id')
+          must("INSERT INTO pg_boundary.secret VALUES (1,'SYNTHETIC_SECRET_PG')")
+          must("CREATE USER pg_limited IDENTIFIED WITH plaintext_password BY 'synthetic-pg-password'")
+          must('GRANT SELECT ON pg_boundary.secret TO pg_limited')
+          print('GRANTS_BASE',http('SHOW GRANTS FOR pg_limited'),flush=True)
+          conn=psycopg.connect(host='127.0.0.1',port=9005,user='pg_limited',password='synthetic-pg-password',dbname='default',autocommit=True,connect_timeout=10,prepare_threshold=None)
+          with conn.cursor() as c:
+              c.execute('SELECT note FROM pg_boundary.secret WHERE id=1 LIMIT 1')
+              print('PG_BEFORE',c.fetchall(),flush=True)
+              c.execute('PREPARE p AS SELECT note FROM pg_boundary.secret WHERE id=1 LIMIT 1')
+              c.execute('EXECUTE p')
+              print('PG_PREPARE_BEFORE',c.fetchall(),flush=True)
+          must('REVOKE SELECT ON pg_boundary.secret FROM pg_limited')
+          print('GRANTS_AFTER',http('SHOW GRANTS FOR pg_limited'),flush=True)
+          print('HTTP_CONTROL',http('SELECT note FROM pg_boundary.secret WHERE id=1 LIMIT 1','pg_limited'),flush=True)
+          with conn.cursor() as c:
+              for label,query in [
+                  ('PREPARED_AFTER_REVOKE','EXECUTE p'),
+                  ('SIMPLE_AFTER_REVOKE','SELECT note FROM pg_boundary.secret WHERE id=1 LIMIT 1')
+              ]:
+                  try:
+                      c.execute(query)
+                      answer=c.fetchall()
+                      print('SECURITY_TEST',label,'UNEXPECTED_SUCCEEDED',answer,flush=True)
+                      raise AssertionError(f'UNAUTHORIZED_READ_{label}')
+                  except psycopg.Error as exc:
+                      print('SECURITY_TEST',label,'DENIED',str(exc)[:450],flush=True)
+          conn.close()
+          # Second: library extended prepare, SQL parsed and executed once before revocation.
+          must('GRANT SELECT ON pg_boundary.secret TO pg_limited')
+          ext=psycopg.connect(host='127.0.0.1',port=9005,user='pg_limited',password='synthetic-pg-password',dbname='default',autocommit=True,connect_timeout=10,prepare_threshold=0)
+          with ext.cursor() as c:
+              try:
+                  c.execute('SELECT note FROM pg_boundary.secret WHERE id=%s LIMIT 1',(1,))
+                  print('PG_EXTENDED_BEFORE',c.fetchall(),flush=True)
+                  ready=True
+              except psycopg.Error as exc:
+                  print('PG_EXTENDED_UNSUPPORTED',str(exc)[:480],flush=True)
+                  ready=False
+          if ready:
+              must('REVOKE SELECT ON pg_boundary.secret FROM pg_limited')
+              with ext.cursor() as c:
+                  try:
+                      c.execute('SELECT note FROM pg_boundary.secret WHERE id=%s LIMIT 1',(1,))
+                      answer=c.fetchall()
+                      print('SECURITY_TEST EXTENDED_UNEXPECTED_SUCCEEDED',answer,flush=True)
+                      raise AssertionError('UNAUTHORIZED_READ_EXTENDED_AFTER_REVOKE')
+                  except psycopg.Error as exc:
+                      print('SECURITY_TEST EXTENDED_DENIED',str(exc)[:480],flush=True)
+          ext.close()
+          print('VERDICT_NO_BYPASS_IF_ALL_DENIED',flush=True)
+          PY
+          python3 /tmp/pg.py
+      - name: Docker diagnostics
+        if: failure()
+        run: docker logs ch 2>&1 | tail -95
