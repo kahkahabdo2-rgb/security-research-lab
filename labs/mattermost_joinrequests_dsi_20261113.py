@@ -98,7 +98,7 @@ def main():
     check("T00_outsider_team_channel_listing_denied",st in (403,404),st,"403/404")
     st,anon_view,_=request("GET",f"/channels/{chid}")
     check("T00_anonymous_private_channel_denied",anon_view is None or st in (401,403,404),st,"401/403/404")
-        st,adminview,_=request("GET",f"/channels/{chid}",token=A)
+    st,adminview,_=request("GET",f"/channels/{chid}",token=A)
     check("T00_admin_private_metadata_control",st==200 and adminview.get("header")==private_header and adminview.get("purpose")==private_purpose,
           {"http":st,"header_canary":adminview.get("header")==private_header,"purpose_canary":adminview.get("purpose")==private_purpose},"admin sees own channel metadata")
     st,from_other_team,_=request("GET",f"/channels/{chid}",token=B)
