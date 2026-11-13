@@ -71,6 +71,8 @@ def main():
     normal_token=login(victim_name,pw)
     sf=secrets.token_hex(5)
     st,team,_=request("POST","/api/v4/teams",{"name":"oauth"+sf,"display_name":"OAuth Consent Lab","type":"O"},owner_token)
+    if st!=201:
+        print("TEAM_CREATE_ERROR "+json.dumps({"status":st,"error_id":team.get("id"),"message":team.get("message")}),flush=True)
     must(st,201,"isolated team")
     tid=team["id"]
     st,_,_=request("POST",f"/api/v4/teams/{tid}/members",{"team_id":tid,"user_id":victim_id},owner_token)
