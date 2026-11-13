@@ -1,0 +1,102 @@
+name: Isolated Teletraan Config History Audit Boundary (Official Schema)
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/teletraan-config-history-audit-20261113.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-mysql-schema-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout unmodified Pinterest Teletraan
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/pinterest/teletraan.git upstream
+          cd upstream
+          git checkout b5212f5ab50486d623fcb493cca36558c70ee467
+          git status --porcelain
+          git rev-parse HEAD
+
+      - name: Start isolated MySQL 8.4
+        run: |
+          docker run -d --name teletraan-audit-db -e MYSQL_ROOT_PASSWORD=lab-only-password -e MYSQL_DATABASE=lab mysql:8.4
+          for i in $(seq 1 100); do
+            if docker exec --env MYSQL_PWD=lab-only-password teletraan-audit-db mysqladmin ping -uroot --silent 2>/dev/null; then
+              echo "MySQL ready"; break
+            fi
+            sleep 2
+          done
+          docker exec --env MYSQL_PWD=lab-only-password teletraan-audit-db mysql -uroot -N -e 'SELECT @@version, @@sql_mode'
+
+      - name: Reproduce DB boundary using EXACT upstream schema and check source write ordering
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import subprocess
+
+          root = pathlib.Path('upstream')
+          ddl = (root / 'deploy-service/common/src/main/resources/sql/deploy.sql').read_text()
+          endpoint = (root / 'deploy-service/teletraanservice/src/main/java/com/pinterest/teletraan/resource/EnvScriptConfigs.java').read_text()
+          handler = (root / 'deploy-service/common/src/main/java/com/pinterest/deployservice/handler/ConfigHistoryHandler.java').read_text()
+          data_handler = (root / 'deploy-service/common/src/main/java/com/pinterest/deployservice/handler/DataHandler.java').read_text()
+
+          assert endpoint.index('environHandler.updateScriptConfigs(') < endpoint.index('configHistoryHandler.updateConfigHistory('), 'Config write must precede audit'
+          assert 'LOG.warn("Failed to persist a config change' in handler, 'Audit insert catch expected'
+          assert 'dataDAO.update(id, dataBean)' in data_handler, 'Expected real DAO write'
+          assert 'config_change       VARCHAR(8192)' in ddl
+          assert re.search(r'data\s+TEXT\s+NOT NULL', ddl)
+
+          def sql(command, expect_success=True):
+              p = subprocess.run(
+                  ['docker', 'exec', '-i', '--env', 'MYSQL_PWD=lab-only-password',
+                   'teletraan-audit-db', 'mysql', '-uroot', '-B', '-N', 'lab'],
+                  input=command, text=True, capture_output=True
+              )
+              if expect_success and p.returncode != 0:
+                  raise AssertionError('MySQL unexpectedly failed: ' + p.stderr[:600])
+              return p
+
+          def original_create_table(table):
+              match = re.search(
+                  r'CREATE TABLE IF NOT EXISTS ' + re.escape(table) + r'\s*\(.*?\)\s*ENGINE=InnoDB DEFAULT CHARSET=utf8;',
+                  ddl, re.S
+              )
+              assert match, table + ' DDL not found in official source'
+              return match.group(0)
+
+          sql(original_create_table('datas') + '\n' + original_create_table('config_history'))
+          small = "CONCAT('{\"X\":\"', REPEAT('A', 100), '\"}')"
+          large = "CONCAT('{\"X\":\"', REPEAT('B', 9000), '\"}')"
+
+          # Baseline: both the operational configuration and its audit record persist.
+          sql("INSERT INTO datas(data_id,data_kind,operator,timestamp,data) VALUES ('data-small','MAP','writer-lab',1,"+small+");")
+          sql("INSERT INTO config_history(config_id,change_id,creation_time,operator,type,config_change) VALUES ('stage-lab','change-small',1,'writer-lab','script',"+small+");")
+          assert sql("SELECT COUNT(*) FROM config_history WHERE change_id='change-small'").stdout.strip() == '1'
+
+          # 9008-byte JSON: operational configuration fits TEXT; audit fails the original VARCHAR(8192).
+          sql("INSERT INTO datas(data_id,data_kind,operator,timestamp,data) VALUES ('data-large','MAP','writer-lab',2,"+large+");")
+          length = int(sql("SELECT LENGTH(data) FROM datas WHERE data_id='data-large'").stdout.strip())
+          assert length > 8192, length
+          history_attempt = sql(
+              "INSERT INTO config_history(config_id,change_id,creation_time,operator,type,config_change) VALUES ('stage-lab','change-large',2,'writer-lab','script',"+large+");",
+              expect_success=False
+          )
+          assert history_attempt.returncode != 0, 'Oversize audit unexpectedly accepted; inspect sql_mode'
+          assert 'Data too long' in history_attempt.stderr, history_attempt.stderr[:400]
+          assert sql("SELECT COUNT(*) FROM config_history WHERE change_id='change-large'").stdout.strip() == '0'
+          assert sql("SELECT COUNT(*) FROM datas WHERE data_id='data-large'").stdout.strip() == '1'
+
+          print('OFFICIAL_SOURCE_SHA=b5212f5ab50486d623fcb493cca36558c70ee467')
+          print('BASELINE: configuration persisted=YES, history persisted=YES')
+          print('OVERSIZE: configuration persisted=YES, bytes='+str(length)+', history persisted=NO')
+          print('EXPECTED_SQL_ERROR='+history_attempt.stderr.strip()[:180])
+          print('NATIVE_MYSQL_SCHEMA_BOUNDARY_PROVEN=TRUE')
+          print('NOTE: This test proves MySQL persistence boundary and source ordering, NOT a full HTTP API E2E.')
+          PY
