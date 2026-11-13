@@ -1,0 +1,100 @@
+name: HTTP PUT x JSON defaults x async insert cross-user identity E2E
+on:
+  push:
+    branches: [research-clickhouse-http-path-protocol-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Start official ClickHouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/paths.xml <<'XML'
+          <clickhouse><http_allow_path_requests>true</http_allow_path_requests></clickhouse>
+          XML
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            -v /tmp/paths.xml:/etc/clickhouse-server/config.d/paths.xml:ro \
+            clickhouse/clickhouse-server:head
+          for i in {1..95}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Execute cross-user simultaneous inserts with server-generated owner
+        shell: bash
+        run: |
+          cat > /tmp/identity.py <<'PY'
+          import base64,concurrent.futures,json,threading,time,urllib.request,urllib.error
+          creds={"admin":"synthetic-admin-password","writer_a":"synthetic-writer-a-password","writer_b":"synthetic-writer-b-password"}
+          base="http://127.0.0.1:8123"
+          def request(path,data,user="admin",method="POST"):
+              rq=urllib.request.Request(base+path,data=data.encode() if data is not None else None,method=method)
+              rq.add_header("Authorization","Basic "+base64.b64encode(f"{user}:{creds[user]}".encode()).decode())
+              try:
+                  with urllib.request.urlopen(rq,timeout=35) as r:return r.status,r.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:return e.code,e.read().decode(errors="replace").strip()
+          def sql(q,u="admin"):
+              c,b=request("/",q,u)
+              print("SQL",u,repr(q),c,repr(b[:290]),flush=True)
+              return c,b
+          def must(q):
+              c,b=sql(q)
+              if c!=200:raise RuntimeError((q,c,b))
+          must("CREATE DATABASE async_identity")
+          must("CREATE TABLE async_identity.rows (id UInt64, owner String DEFAULT currentUser()) ENGINE=MergeTree ORDER BY id")
+          for u in ("writer_a","writer_b"):
+              must(f"CREATE USER {u} IDENTIFIED WITH plaintext_password BY '{creds[u]}'")
+              must(f"GRANT INSERT ON async_identity.rows TO {u}")
+              must(f"ALTER USER {u} SETTINGS http_allow_database_as_path=1,http_allow_table_as_file=1")
+              assert sql("SELECT * FROM async_identity.rows",u)[0]==403
+          path="/async_identity/rows.JSONEachRow?input_format_defaults_for_omitted_fields=1"
+          for u,v in [("writer_a",1),("writer_b",2)]:
+              c,b=request(path,json.dumps({"id":v})+"\n",u,"PUT")
+              print("SYNC_CONTROL",u,c,repr(b[:250]),flush=True)
+              if c!=200:raise RuntimeError("SYNC_PATH_NOT_WORKING")
+          c,b=sql("SELECT id,owner FROM async_identity.rows ORDER BY id")
+          print("SYNC_ROWS",c,repr(b),flush=True)
+          if c!=200:raise RuntimeError(b)
+          control={int(x.split("\t")[0]):x.split("\t")[1] for x in b.splitlines() if "\t" in x}
+          if control.get(1)!="writer_a" or control.get(2)!="writer_b":
+              print("SETUP_LIMITATION_DEFAULT_IDENTITY",control,flush=True)
+              raise RuntimeError("Synchronous default owner did not reflect identity")
+          sync=threading.Barrier(8)
+          def send_one(n):
+              u="writer_a" if n%2==0 else "writer_b"
+              sync.wait(timeout=20)
+              p=path+"&async_insert=1&wait_for_async_insert=0&async_insert_busy_timeout_ms=1000"
+              return n,u,request(p,json.dumps({"id":100+n})+"\n",u,"PUT")
+          with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+              results=list(pool.map(send_one,range(8)))
+          for n,u,(code,body) in results:
+              print("ASYNC_REQUEST",n,u,code,repr(body[:220]),flush=True)
+          time.sleep(3)
+          c,b=sql("SELECT id,owner FROM async_identity.rows WHERE id >= 100 ORDER BY id LIMIT 15 SETTINGS max_execution_time=10,max_rows_to_read=100")
+          print("ASYNC_ROWS",c,repr(b),flush=True)
+          if c!=200:raise RuntimeError(b)
+          observed={int(x.split("\t")[0]):x.split("\t")[1] for x in b.splitlines() if "\t" in x}
+          if len(observed)!=8:
+              print("ASYNC_LOSS_OR_REJECTION rows",len(observed),flush=True)
+          violations=[]
+          for n in range(8):
+              expected="writer_a" if n%2==0 else "writer_b"
+              actual=observed.get(100+n)
+              if actual is not None and actual != expected:
+                  violations.append((100+n,expected,actual))
+          if violations:
+              print("SECURITY_CANDIDATE_IDENTITY_MISATTRIBUTION",violations,flush=True)
+              raise AssertionError("Async insert assigned another user's identity to one or more rows")
+          print("NO_CROSS_USER_OWNER_MIXING",observed,flush=True)
+          PY
+          python3 /tmp/identity.py
+      - name: Docker logs if failed
+        if: failure()
+        run: docker logs ch 2>&1 | tail -80
