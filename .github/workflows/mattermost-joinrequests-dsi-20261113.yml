@@ -1,0 +1,62 @@
+name: Mattermost 12.0.2 Discoverable Join Requests DSI
+on:
+  push:
+    branches: [research/mattermost-joinrequests-dsi-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  join-request-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start unmodified official Mattermost and disposable PostgreSQL
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name mm-jr-db --network host \
+            -e POSTGRES_USER=mmuser -e POSTGRES_PASSWORD=mm_lab_only_password \
+            -e POSTGRES_DB=mattermost postgres:16-alpine
+          docker run -d --name mm-jr-app --network host \
+            -e MM_SQLSETTINGS_DRIVERNAME=postgres \
+            -e 'MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:mm_lab_only_password@127.0.0.1:5432/mattermost?sslmode=disable&connect_timeout=10' \
+            -e MM_SERVICESETTINGS_SITEURL=http://127.0.0.1:8065 \
+            -e MM_TEAMSETTINGS_ENABLEOPENSERVER=true \
+            -e MM_EMAILSETTINGS_ENABLESIGNUPWITHEMAIL=true \
+            -e MM_EMAILSETTINGS_REQUIREEMAILVERIFICATION=false \
+            -e MM_FEATUREFLAGS_DISCOVERABLECHANNELS=true \
+            -e MM_LOGSETTINGS_ENABLEFILE=false \
+            mattermost/mattermost-team-edition:12.0.2
+          docker image inspect mattermost/mattermost-team-edition:12.0.2 --format 'OFFICIAL_IMAGE={{.RepoTags}} IMAGE_ID={{.Id}}'
+      - name: Wait for ready native server
+        shell: bash
+        run: |
+          set -euo pipefail
+          for n in $(seq 1 130); do
+            if curl --silent --fail --max-time 3 http://127.0.0.1:8065/api/v4/system/ping >/dev/null; then
+              echo 'OFFICIAL_SERVER_READY=YES'
+              exit 0
+            fi
+            if [[ "$(docker inspect --format '{{.State.Running}}' mm-jr-app)" != "true" ]]; then
+              echo 'OFFICIAL_SERVER_STOPPED=YES'
+              docker logs mm-jr-app --tail 70 | grep -E 'ERROR|FATAL|panic' || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo 'OFFICIAL_SERVER_READY=NO'
+          docker logs mm-jr-app --tail 70 | grep -E 'ERROR|FATAL|panic' || true
+          exit 1
+      - name: Install minimal WebSocket client
+        run: python3 -m pip install --quiet websocket-client
+      - name: Execute multi-user native HTTP and WS state-transition test
+        run: python3 labs/mattermost_joinrequests_dsi_20261113.py
+      - name: Sanitized diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo 'DOCKER_STATUS'
+          docker ps --format '{{.Names}} {{.Status}}' || true
+          echo 'MATTERMOST_ERROR_LINES'
+          docker logs mm-jr-app 2>&1 | grep -E 'ERROR|FATAL|panic' | tail -30 || true
