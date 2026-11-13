@@ -13,7 +13,14 @@ CHECKS=[]
 class Probe(BaseHTTPRequestHandler):
     def do_POST(self):
         payload=self.rfile.read(min(int(self.headers.get("Content-Length","0")),8192))
-        SEEN.append({"path":self.path,"payload":payload.decode(errors="replace")})
+        SEEN.append({"path":self.path,"payload":payload.decode(errors="replace"),
+            "bearer_forwarded":self.headers.get("Authorization","").startswith("Bearer ")})
+        if self.path=="/plugins/redirect-internal":
+            # Redirect to a different IP+path; never leave the disposable CI worker.
+            self.send_response(307)
+            self.send_header("Location",f"http://127.0.0.2:{PORT}/redirect-final")
+            self.send_header("Content-Length","0")
+            self.end_headers();return
         data=json.dumps({"type":"ok"}).encode()
         self.send_response(200);self.send_header("Content-Type","application/json")
         self.send_header("Content-Length",str(len(data)));self.end_headers();self.wfile.write(data)
@@ -44,7 +51,7 @@ def submit(t,channel,team,url):
       "url":url,"channel_id":channel,"team_id":team,"submission":{"probe":"only_test_data"},
       "callback_id":"lab","state":"lab","file_ids":[]},t)
 def main():
-    server=ThreadingHTTPServer(("127.0.0.1",PORT),Probe)
+    server=ThreadingHTTPServer(("0.0.0.0",PORT),Probe)
     threading.Thread(target=server.serve_forever,daemon=True).start()
     suffix=secrets.token_hex(4);pwd="Aa9!"+secrets.token_urlsafe(22)
     users=[];tokens=[]
@@ -85,6 +92,28 @@ def main():
         check(f"T0{index}_loopback_variant", (landed and c==200) if ALLOWED else not landed,
               {"http":c,"internal_request_arrived":landed},
               "arrives only when explicit allowlist permits this address")
+    # HYPOTHESIS: same hostname and /plugins-looking path incorrectly switches
+    # to the *trusted* transport even when target is a different TCP port.
+    for idx,plugin_path in enumerate(("/plugins/owned-internal","/plugins-malformed-branch"),1):
+        previous=len(SEEN)
+        st,body,_=submit(B,pubid,tid,f"http://127.0.0.1:{PORT}{plugin_path}")
+        matching=[h for h in SEEN[previous:] if h["path"]==plugin_path]
+        reached=bool(matching)
+        forwarded=bool(matching and matching[-1]["bearer_forwarded"])
+        check("T09_trusted_plugin_prefix_cross_port_"+str(idx),
+            reached and st==200 and forwarded,
+            {"http":st,"internal_request_arrived":reached,"bearer_header_forwarded":forwarded},
+            "Default-untrusted config: bad plugin path+different port should not be treated as trusted; if pass=true, bypass reproduced")
+    # Follow trusted HTTP 307 to *another* loopback address, outside plugin path.
+    previous=len(SEEN)
+    st,body,_=submit(B,pubid,tid,f"http://127.0.0.1:{PORT}/plugins/redirect-internal")
+    newhits=SEEN[previous:]
+    last_hit=any(h["path"]=="/redirect-final" for h in newhits)
+    check("T11_trusted_plugin_redirect_cross_ip",
+          last_hit and st==200,
+          {"http":st,"request_landed_at_other_internal_ip":last_hit},
+          "If true, trust survives redirection beyond plugin endpoint")
+    # One HTTP request in each test is non-destructive, only owned canary data.
     # Attack-controlled fields must not impersonate an identity or team downstream even in allowed control.
     if ALLOWED and SEEN:
         sample=json.loads(SEEN[0]["payload"])
