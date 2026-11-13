@@ -68,7 +68,7 @@ def main():
         ids.append(data["id"])
     for u in usernames: tokens.append(login(u,pwd))
     A,B,C=tokens;aid,bid,cid=ids
-    st,t1,_=request("POST","/teams",{"name":"jrteam1"+suffix,"display_name":"JR Team One","type":"O"},A)
+    st,t1,_=request("POST","/teams",{"name":"jrteam1"+suffix,"display_name":"JR Invite-Only Team","type":"I"},A)
     expected(st,201,"team1 create")
     st,t2,_=request("POST","/teams",{"name":"jrteam2"+suffix,"display_name":"JR Team Two","type":"O"},A)
     expected(st,201,"team2 create")
@@ -86,7 +86,19 @@ def main():
     expected(st,201,"create discoverable private channel")
     chid=ch["id"]
     print("CONFIG "+json.dumps({"channel_discoverable":ch.get("discoverable"),"private":ch.get("type")=="P"}),flush=True)
-    st,adminview,_=request("GET",f"/channels/{chid}",token=A)
+    st,missing_member,_=request("GET",f"/teams/{t1id}/members/{bid}",token=A)
+    check("T00_outsider_has_no_membership_in_invite_only_team",
+          st in (403,404),{"http":st,"member_data":isinstance(missing_member,dict) and "user_id" in missing_member},
+          "B is not on invite-only team")
+    st,team_view,_=request("GET",f"/teams/{t1id}",token=B)
+    check("T00_outsider_team_lookup",True,{"http":st,
+          "team_name_visible":isinstance(team_view,dict) and team_view.get("name")=="jrteam1"+suffix},
+          "record whether invite-only team metadata is hidden")
+    st,team_channels,_=request("GET",f"/teams/{t1id}/channels",token=B)
+    check("T00_outsider_team_channel_listing_denied",st in (403,404),st,"403/404")
+    st,anon_view,_=request("GET",f"/channels/{chid}")
+    check("T00_anonymous_private_channel_denied",anon_view is None or st in (401,403,404),st,"401/403/404")
+        st,adminview,_=request("GET",f"/channels/{chid}",token=A)
     check("T00_admin_private_metadata_control",st==200 and adminview.get("header")==private_header and adminview.get("purpose")==private_purpose,
           {"http":st,"header_canary":adminview.get("header")==private_header,"purpose_canary":adminview.get("purpose")==private_purpose},"admin sees own channel metadata")
     st,from_other_team,_=request("GET",f"/channels/{chid}",token=B)
