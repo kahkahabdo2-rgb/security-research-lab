@@ -1,0 +1,139 @@
+name: ClickHouse SQLite trust-boundary microtests
+on:
+  push:
+    branches:
+      - research/clickhouse-sqlite-boundary-20261113
+permissions:
+  contents: read
+jobs:
+  official-release-microtests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - name: Run isolated official-release attacker and control cases
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NAME="ch-sqlite-boundary-$GITHUB_RUN_ID"
+          IMAGE="clickhouse/clickhouse-server:26.10.3.7"
+          FAIL=0
+          pass() { echo "PASS: $1"; }
+          fail() { echo "FAIL: $1"; FAIL=1; }
+          blocked() { echo "BLOCKED: $1"; }
+          docker run -d --name "$NAME" --network none --memory 3g --cpus 2 \
+            -e CLICKHOUSE_USER=auditadmin \
+            -e CLICKHOUSE_PASSWORD='SyntheticAuditPass123' \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 "$IMAGE"
+          trap 'docker rm -f "$NAME" >/dev/null 2>&1 || true' EXIT
+          ch() { docker exec "$NAME" clickhouse-client --user "$1" --password "$2" --query "$3"; }
+          ready=0
+          for n in $(seq 1 45); do
+            if ch auditadmin SyntheticAuditPass123 "SELECT 1" >/dev/null 2>&1; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs "$NAME" --tail 45
+            echo "BLOCKED: official server could not start"
+            exit 2
+          fi
+          echo "OFFICIAL_VERSION=$(ch auditadmin SyntheticAuditPass123 'SELECT version()')"
+          python3 - <<'PY'
+          import sqlite3
+          with sqlite3.connect('/tmp/chsqlite_base.db') as cx:
+              cx.execute('CREATE TABLE allowed(id INT)')
+              cx.execute('INSERT INTO allowed VALUES (7)')
+              cx.commit()
+          PY
+          docker cp /tmp/chsqlite_base.db "$NAME:/var/lib/clickhouse/user_files/base.sqlite"
+          docker exec -u root "$NAME" sh -c \
+            "mkdir -p '/var/lib/clickhouse/user_files/file:..'; printf 'SYNTHETIC_SENTINEL' > /var/lib/clickhouse/outside.sqlite; chown -R clickhouse:clickhouse /var/lib/clickhouse/user_files; chown clickhouse:clickhouse /var/lib/clickhouse/outside.sqlite"
+          ch auditadmin SyntheticAuditPass123 "CREATE USER reader IDENTIFIED WITH plaintext_password BY 'ReaderTestPass123'"
+          ch auditadmin SyntheticAuditPass123 "CREATE USER writer IDENTIFIED WITH plaintext_password BY 'WriterTestPass123'"
+          ch auditadmin SyntheticAuditPass123 "GRANT CREATE TEMPORARY TABLE ON *.* TO reader, writer"
+          ch auditadmin SyntheticAuditPass123 "GRANT READ ON SQLITE TO reader"
+          ch auditadmin SyntheticAuditPass123 "GRANT WRITE ON FILE TO writer"
+          ch auditadmin SyntheticAuditPass123 "GRANT READ ON SQLITE TO writer"
+          if ch reader ReaderTestPass123 "SELECT * FROM sqlite('base.sqlite', 'allowed')" 2>&1 | grep -q '^7$'; then
+            pass 'positive control: reader can access synthetic sqlite file'
+          else
+            fail 'positive control: SQLite access failed'
+          fi
+          if ch reader ReaderTestPass123 "INSERT INTO TABLE FUNCTION sqlite('base.sqlite', query('SELECT id FROM allowed')) VALUES (99)" >/tmp/reject-query.log 2>&1; then
+            fail 'query-backed SQLite source unexpectedly accepted INSERT'
+          else
+            pass 'negative control: query-backed SQLite source refuses INSERT'
+          fi
+          if ch reader ReaderTestPass123 "SELECT * FROM sqlite('/var/lib/clickhouse/outside.sqlite', 'allowed')" >/tmp/reject-path.log 2>&1; then
+            fail 'absolute path outside user_files unexpectedly accepted'
+          else
+            pass 'negative control: path outside user_files rejected'
+          fi
+          if ch reader ReaderTestPass123 "SELECT * FROM sqlite('base.sqlite', query('WITH removed AS (DELETE FROM allowed RETURNING id) SELECT id FROM removed'))" >/tmp/reject-write.log 2>&1; then
+            fail 'query-backed SELECT unexpectedly performed write CTE'
+          else
+            pass 'negative control: write-like query rejected'
+          fi
+          if ch reader ReaderTestPass123 "SELECT * FROM sqlite('base.sqlite', 'allowed')" 2>&1 | grep -q '^7$'; then
+            pass 'integrity control: attempted mutation did not modify data'
+          else
+            fail 'integrity control: allowed data changed'
+          fi
+          if ch reader ReaderTestPass123 "SELECT 1 FORMAT SQLite" >/tmp/sqlite-reader-output.sqlite 2>/tmp/reader-out.log; then
+            python3 - <<'PY'
+          import sqlite3
+          cx = sqlite3.connect('file:/tmp/sqlite-reader-output.sqlite?mode=ro', uri=True)
+          assert cx.execute('SELECT * FROM "table"').fetchone() == (1,)
+          print('PASS: in-memory SQLite output is valid')
+          PY
+          else
+            fail 'in-memory SQLite output failed'
+          fi
+          if ch reader ReaderTestPass123 "INSERT INTO TABLE FUNCTION file('denied.sqlite', 'SQLite', 'v UInt64') VALUES (6)" >/tmp/reject-no-file.log 2>&1; then
+            fail 'reader without WRITE ON FILE unexpectedly wrote output'
+          else
+            pass 'negative control: no WRITE ON FILE blocks file output'
+          fi
+          if ch writer WriterTestPass123 "INSERT INTO TABLE FUNCTION file('basic.sqlite', 'SQLite', 'v UInt64') VALUES (7)" >/tmp/basic.log 2>&1; then
+            docker cp "$NAME:/var/lib/clickhouse/user_files/basic.sqlite" /tmp/basic.sqlite
+            python3 - <<'PY'
+          import sqlite3
+          cx = sqlite3.connect('file:/tmp/basic.sqlite?mode=ro', uri=True)
+          assert cx.execute('SELECT * FROM "table"').fetchone() == (7,)
+          print('PASS: positive control: WRITE ON FILE generated valid database')
+          PY
+          else
+            echo 'CONTROL_ERROR:'; cat /tmp/basic.log
+            fail 'positive file output failed; other file-boundary results not probative'
+          fi
+          if ch writer WriterTestPass123 "INSERT INTO TABLE FUNCTION file('../outside.sqlite', 'SQLite', 'v UInt64') VALUES (11)" >/tmp/reject-traversal.log 2>&1; then
+            fail 'direct ../ path traversal unexpectedly allowed'
+          else
+            pass 'negative control: direct ../ traversal rejected'
+          fi
+          if ch writer WriterTestPass123 "INSERT INTO TABLE FUNCTION file('file:../outside.sqlite?mode=rwc', 'SQLite', 'v UInt64') VALUES (13)" >/tmp/uri.log 2>&1; then
+            pass 'URI-looking relative filename accepted for testing'
+          else
+            echo 'URI_ATTEMPT_REJECTED:'; cat /tmp/uri.log
+            blocked 'URI-looking filename rejected; no path-escape claim'
+          fi
+          docker cp "$NAME:/var/lib/clickhouse/outside.sqlite" /tmp/outside-after.sqlite
+          if [ "$(cat /tmp/outside-after.sqlite)" = "SYNTHETIC_SENTINEL" ]; then
+            pass 'sensitive boundary: outside sentinel unchanged after URI experiment'
+          else
+            fail 'sensitive boundary: outside sentinel modified (investigate unauthorized write)'
+          fi
+          if ch reader ReaderTestPass123 "SELECT 1 FORMAT SQLite SETTINGS output_format_sqlite_table_name = 'safe\`); ATTACH DATABASE \"/tmp/evil\" AS e; --'" >/tmp/injected-output.sqlite 2>/tmp/identifier.log; then
+            python3 - <<'PY'
+          import sqlite3
+          cx=sqlite3.connect('file:/tmp/injected-output.sqlite?mode=ro', uri=True)
+          names=[r[0] for r in cx.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+          print('IDENTIFIER_TEST_TABLES=',repr(names))
+          assert len(names)==1
+          print('PASS: output table-name injection remained one escaped identifier')
+          PY
+          else
+            echo 'IDENTIFIER_TEST_REJECTED:'; cat /tmp/identifier.log
+            blocked 'identifier injection was rejected; cannot assert SQLite SQL execution'
+          fi
+          echo "SUMMARY_FAIL_COUNT=$FAIL"
+          test "$FAIL" -eq 0
