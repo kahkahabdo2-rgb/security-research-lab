@@ -167,7 +167,7 @@ jobs:
           HTTPServer(('127.0.0.1',9090),H).serve_forever()
           PY
           python3 /tmp/identity_provider_lab.py > /tmp/idp.log 2>&1 &
-          docker exec --env MYSQL_PWD=lab-only-password teletraan-native-mysql mysql -uroot deploy <<'SQL'
+          docker exec -i --env MYSQL_PWD=lab-only-password teletraan-native-mysql mysql -uroot deploy <<'SQL'
           INSERT INTO users_and_roles(user_name,resource_id,resource_type,role) VALUES
           ('writer-lab','auditlab','ENV','WRITE'),
           ('writer-lab','*','SYSTEM','READ'),
@@ -175,6 +175,9 @@ jobs:
           INSERT INTO environs (env_id,env_name,stage_name,env_state,max_parallel,priority,stuck_th,success_th,last_operator,last_update,accept_type,max_deploy_num,max_deploy_day,state,override_policy)
           VALUES ('labotherenv000000001','otherlab','dev','NORMAL',1,'NORMAL',30,50,'lab',1,'AUTO',2,2,'NORMAL','WARN');
           SQL
+          echo "AUTHZ_LAB_ROLE_ROWS=$(docker exec --env MYSQL_PWD=lab-only-password teletraan-native-mysql mysql -uroot deploy -N -e "SELECT COUNT(*) FROM users_and_roles WHERE user_name IN ('writer-lab','reader-lab')")"
+          test "$(docker exec --env MYSQL_PWD=lab-only-password teletraan-native-mysql mysql -uroot deploy -N -e "SELECT COUNT(*) FROM users_and_roles WHERE user_name IN ('writer-lab','reader-lab')")" = 3
+          test "$(docker exec --env MYSQL_PWD=lab-only-password teletraan-native-mysql mysql -uroot deploy -N -e "SELECT COUNT(*) FROM environs WHERE env_name='otherlab'")" = 1
           python3 - <<'PY'
           from pathlib import Path
           p=Path('upstream/deploy-service/teletraanservice/bin/server.yaml')
