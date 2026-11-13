@@ -9,15 +9,21 @@ jobs:
   handler:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["clickhouse/clickhouse-server:26.10.3.7", "clickhouse/clickhouse-server:head"]
     steps:
-      - name: Launch stock ClickHouse HEAD
+      - name: Launch stock ClickHouse release
+        env:
+          CH_IMAGE: ${{ matrix.image }}
         shell: bash
         run: |
           set -euo pipefail
           docker run -d --name ch-handler --network host --memory 4g --ulimit nofile=262144:262144 \
             -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-only \
             -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
-            clickhouse/clickhouse-server:head
+            "$CH_IMAGE"
           for i in {1..90}; do
             if curl -fsS --user admin:synthetic-admin-only "http://127.0.0.1:8123/?query=SELECT%201" >/dev/null; then break; fi
             sleep 2
@@ -67,6 +73,12 @@ jobs:
           no_sink=outcome("creator_cannot_select_legit_sink",c==403,(c,d[:220]))
           c,d=sql("INSERT INTO handler_lab.captured VALUES ('NO_WRITE')","creator")
           no_insert=outcome("creator_cannot_insert_capture_directly",c==403,(c,d[:220]))
+          c,d=sql("ALTER HANDLER z_legit URL '/lab/ingest2'","creator")
+          alter_denied=outcome("creator_cannot_alter_admin_handler",c==403,(c,d[:220]))
+          c,d=sql("DROP HANDLER z_legit","creator")
+          drop_denied=outcome("creator_cannot_drop_admin_handler",c==403,(c,d[:220]))
+          c,d=sql("CREATE HANDLER b_exact URL '/lab/ingest' METHODS (POST) AS SELECT 1","creator")
+          exact_denied=outcome("same_exact_route_collision_rejected",c!=200,(c,d[:220]))
           # Same path, different matching type: the regex is deliberately lexicographically earlier.
           payload_query="CREATE HANDLER a_capture URL REGEXP '/lab/ingest' METHODS (POST) AS INSERT INTO handler_lab.captured SELECT {_request_body:String}"
           c,d=sql(payload_query,"creator")
@@ -84,7 +96,7 @@ jobs:
           # The query inside the malicious route should still fail if invoked as low user.
           c,d=req("/lab/ingest","3,ATTACKER_TEST\n",user="creator")
           low_denied=outcome("creator_own_upload_cannot_write_capture",c!=200,(c,d[:200]))
-          if all((baseline,no_sink,no_insert,created,send,leaked,diverted,low_denied)):
+          if all((baseline,no_sink,no_insert,alter_denied,drop_denied,exact_denied,created,send,leaked,diverted,low_denied)):
               print("CANDIDATE_E2E: CREATE HANDLER-only user captured POST body of administrative user through overlapping lexicographically earlier regex, using admin request identity; evaluate CREATE HANDLER authority and expected routing policy.",flush=True)
           else:
               print("VERDICT: Not an independently proven full cross-user body interception",flush=True)
