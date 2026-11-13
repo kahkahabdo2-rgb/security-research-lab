@@ -10,21 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Start isolated MinIO and unmodified ClickHouse
+      - name: Start isolated S3-compatible server and unmodified ClickHouse
         shell: bash
         run: |
           set -euo pipefail
-          docker run -d --name minio --network host \
-            -e MINIO_ROOT_USER=syntheticminio \
-            -e MINIO_ROOT_PASSWORD=syntheticminiopassword \
-            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z \
-            server /data --address ":19000" --console-address ":19001"
-          python3 -m pip -q install --user boto3
+          python3 -m pip -q install --user 'moto[server]>=5.0,<6.0' boto3
+          nohup "$HOME/.local/bin/moto_server" -H 127.0.0.1 -p 19000 >/tmp/moto-s3.log 2>&1 &
           for i in {1..75}; do
-            curl -fsS http://127.0.0.1:19000/minio/health/ready >/dev/null && break
+            if curl -fsS http://127.0.0.1:19000/ >/dev/null; then break; fi
             sleep 2
           done
-          curl -fsS http://127.0.0.1:19000/minio/health/ready
+          curl -fsS http://127.0.0.1:19000/ >/dev/null
           cat > /tmp/ch-s3.xml <<'XML'
           <clickhouse>
             <listen_host>127.0.0.1</listen_host>
@@ -132,5 +128,5 @@ jobs:
         run: |
           echo "=== ClickHouse logs ==="
           docker logs --tail 110 ch 2>&1 | tail -110
-          echo "=== MinIO logs ==="
-          docker logs --tail 55 minio 2>&1 | tail -55
+          echo "=== S3 test server logs ==="
+          tail -55 /tmp/moto-s3.log
