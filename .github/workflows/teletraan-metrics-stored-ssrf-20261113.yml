@@ -42,6 +42,9 @@ jobs:
           done
           test "$ready" = 1
           docker exec -i --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot < upstream/deploy-service/common/src/main/resources/sql/deploy.sql
+          grep -q "ALTER TABLE environs ADD COLUMN stage_type VARCHAR(32)" upstream/deploy-service/common/src/main/resources/sql/schema-update-8.sql
+          grep -q "ALTER TABLE environs MODIFY COLUMN stage_type VARCHAR(32) NOT NULL DEFAULT 'DEFAULT'" upstream/deploy-service/common/src/main/resources/sql/schema-update-11.sql
+          docker exec --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot deploy -e "ALTER TABLE environs ADD COLUMN stage_type VARCHAR(32) NOT NULL DEFAULT 'DEFAULT'"
           docker exec -i --env MYSQL_PWD=lab-only-password teletraan-metrics-db mysql -uroot deploy <<'SQL'
           INSERT INTO environs
             (env_id,env_name,stage_name,env_state,max_parallel,priority,stuck_th,success_th,
