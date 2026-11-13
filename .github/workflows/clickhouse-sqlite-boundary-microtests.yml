@@ -98,7 +98,7 @@ jobs:
             python3 - <<'PY'
           import sqlite3
           cx = sqlite3.connect('file:/tmp/basic.sqlite?mode=ro', uri=True)
-          assert cx.execute('SELECT * FROM "table"').fetchone() == (7,)
+          assert cx.execute('SELECT * FROM "table"').fetchone() == ('7',)
           print('PASS: positive control: WRITE ON FILE generated valid database')
           PY
           else
