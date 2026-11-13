@@ -91,6 +91,60 @@ jobs:
           if not all(good): sys.exit(2)
           PY
           python /tmp/policy_e2e.py
+      - name: Test disk-spilled COPY abort and validation boundaries
+        run: |
+          cat > /tmp/copy_spill_e2e.py <<'PY'
+          import io,sys,base64,urllib.request,psycopg2
+          def admin(query):
+              req=urllib.request.Request("http://127.0.0.1:8123/",query.encode(),method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode(b"admin:lab-admin").decode())
+              with urllib.request.urlopen(req,timeout=20) as resp: return resp.read().decode().strip()
+          def result(name,condition,detail):
+              print(f"RESULT {name}: {'PASS' if condition else 'BYPASS'}; {detail}",flush=True)
+              return condition
+          admin("CREATE TABLE pgwire_authz.copy_spill (id UInt32) ENGINE=MergeTree ORDER BY id")
+          admin("GRANT INSERT ON pgwire_authz.copy_spill TO pg_low")
+          dsn="host=127.0.0.1 port=9005 dbname=default user=pg_low password=pw-low sslmode=disable connect_timeout=10"
+          good=[]
+          with psycopg2.connect(dsn) as conn:
+              with conn.cursor() as cur:
+                  bulk="".join(str(i)+"\\n" for i in range(220000))
+                  assert len(bulk)>1024*1024, len(bulk)
+                  print("STAGED_PAYLOAD_BYTES:",len(bulk),flush=True)
+                  try:
+                      cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",io.StringIO(bulk+"malformed_last_row\\n"))
+                      good.append(result("disk_spill_parse_error",False,"malformed COPY succeeded"))
+                  except Exception as e:
+                      count=admin("SELECT count() FROM pgwire_authz.copy_spill")
+                      good.append(result("disk_spill_parse_error",count=="0",f"rows_after={count}; error={str(e)[:150]}"))
+          class AbortReader:
+              def __init__(self,data):
+                  self.data=data
+                  self.index=0
+              def read(self,size=-1):
+                  if self.index>=len(self.data):
+                      raise OSError("SYNTHETIC_ABORT_AFTER_DISK_SPILL")
+                  if size<0: size=8192
+                  s=self.data[self.index:self.index+size]
+                  self.index+=len(s)
+                  return s
+          with psycopg2.connect(dsn) as conn:
+              with conn.cursor() as cur:
+                  try:
+                      cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",AbortReader(bulk))
+                      good.append(result("disk_spill_copyfail",False,"CopyFail stream unexpectedly succeeded"))
+                  except Exception as e:
+                      count=admin("SELECT count() FROM pgwire_authz.copy_spill")
+                      good.append(result("disk_spill_copyfail",count=="0",f"rows_after={count}; error={str(e)[:150]}"))
+          with psycopg2.connect(dsn) as conn:
+              with conn.cursor() as cur:
+                  cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",io.StringIO("777\\n"))
+          count=admin("SELECT count() FROM pgwire_authz.copy_spill")
+          good.append(result("positive_copy_recovery",count=="1",f"rows={count}"))
+          print("SPILL_COUNTS:",sum(good),"/",len(good),flush=True)
+          if not all(good): sys.exit(2)
+          PY
+          python /tmp/copy_spill_e2e.py
       - name: Logs on failure
         if: failure()
         run: docker logs --tail 120 ch | tail -120
