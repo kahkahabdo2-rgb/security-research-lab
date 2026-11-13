@@ -175,6 +175,13 @@ jobs:
           INSERT INTO environs (env_id,env_name,stage_name,env_state,max_parallel,priority,stuck_th,success_th,last_operator,last_update,accept_type,max_deploy_num,max_deploy_day,state,override_policy)
           VALUES ('labotherenv000000001','otherlab','dev','NORMAL',1,'NORMAL',30,50,'lab',1,'AUTO',2,2,'NORMAL','WARN');
           SQL
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('upstream/deploy-service/teletraanservice/bin/server.yaml')
+          t=p.read_text()
+          assert 'port: 8080' in t and 'port: 8081' in t
+          p.write_text(t.replace('port: 8080','port: 8180').replace('port: 8081','port: 8181'))
+          PY
           cat >> upstream/deploy-service/teletraanservice/bin/server.yaml <<'YAML'
           authentication:
             type: token
@@ -186,7 +193,7 @@ jobs:
           echo $! > /tmp/teletraan-role.pid
           python3 - <<'PY'
           import json, time, subprocess, urllib.request, urllib.error
-          root='http://127.0.0.1:8080/v1/envs/'
+          root='http://127.0.0.1:8180/v1/envs/'
           def fetch(env,method='GET',token='writer-token',data=None):
               u=root+env+'/dev/script_configs'
               req=urllib.request.Request(u,method=method,headers={'Authorization':'Bearer '+token,'Content-Type':'application/json'},data=json.dumps(data).encode() if data is not None else None)
@@ -197,9 +204,17 @@ jobs:
               except urllib.error.HTTPError as e:
                   return e.code,None
           for _ in range(60):
-              s,_=fetch('auditlab')
+              try:
+                  s,_=fetch('auditlab')
+              except urllib.error.URLError:
+                  time.sleep(2)
+                  continue
               if s in (200,403):break
               time.sleep(2)
+          assert s==200, 'Role server did not answer as authenticated writer: '+str(s)
+          s,_=fetch('auditlab',token='NOT-VALID')
+          assert s==401,'A role server must reject unknown token: '+str(s)
+          print('ROLE_SERVER_PORT_8180_AUTHN_ENABLED=YES')
           reader_status=fetch('auditlab','PUT','reader-token',{'CONTROL':'reject'})[0]
           cross_status=fetch('otherlab','PUT','writer-token',{'CONTROL':'reject'})[0]
           assert reader_status==403,reader_status
@@ -223,7 +238,9 @@ jobs:
       - name: Debug logs on failure only
         if: failure()
         run: |
-          echo "END OF BACKEND LOG"
-          tail -n 150 /tmp/teletraan-native.log 2>/dev/null || true
+          echo "END OF ROLE BACKEND LOG"
+          tail -n 90 /tmp/teletraan-role.log 2>/dev/null | cut -c1-280 || true
+          echo "END OF OPEN BACKEND LOG"
+          tail -n 55 /tmp/teletraan-native.log 2>/dev/null | cut -c1-280 || true
           echo "MYSQL CONTAINER"
           docker ps -a || true
