@@ -27,7 +27,7 @@ jobs:
       - name: Install Django-compatible lab runtime (app source unchanged)
         run: |
           python -m pip install -q --upgrade pip
-          python -m pip install -q 'Django==3.2.25' 'django-csp==3.4' 'requests==2.32.3' 'oauthlib==1.0.3' 'concurrent-log-handler==0.9.20' 'python-dateutil==2.8.2' 'pytz==2024.2' 'simplejson==3.19.3' 'diff-match-patch==20241021'
+          python -m pip install -q 'Django==2.2.28' 'django-csp==3.4' 'requests==2.32.3' 'oauthlib==1.0.3' 'concurrent-log-handler==0.9.20' 'python-dateutil==2.8.2' 'pytz==2024.2' 'simplejson==3.19.3' 'diff-match-patch==20241021'
       - name: Generate synthetic local HTTPS-only secret service certificate
         run: |
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 -keyout /tmp/teletraan-metrics-test.key -out /tmp/teletraan-metrics-test.crt -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' >/dev/null 2>&1
@@ -118,5 +118,5 @@ jobs:
           print('INTERNAL_RESPONSE_CONTENT_ORACLE_FALSE=PASS')
 
           print('DJANGO_ROUTE_MIDDLEWARE_CSRF_E2E=PASS')
-          print('NOTE: The original source is unchanged; the lab uses Django 3.2 for Python 3.8 compatibility, not the repository pinned Django 1.11 runtime.')
+          print('NOTE: The original source is unchanged; the lab uses Django 2.2 with legacy django-csp for Python 3.8 compatibility, not the repository pinned Django 1.11 runtime.')
           PY
