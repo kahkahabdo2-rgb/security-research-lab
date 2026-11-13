@@ -1,0 +1,90 @@
+name: Background HTTP query x row-policy x INSERT SELECT E2E
+on:
+  push:
+    branches: [research-clickhouse-detached-rowpolicy-20261113]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  detached:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["26.10.3.7","head"]
+    steps:
+      - name: Start official ClickHouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run -d --name ch --network host --memory 3g --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            clickhouse/clickhouse-server:${{ matrix.image }}
+          for i in {1..100}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:8123/?query=SELECT%20version()'
+      - name: Test detached query authorization and row-level policy after HTTP disconnect
+        shell: bash
+        run: |
+          cat >/tmp/detached.py <<'PY'
+          import base64,urllib.request,urllib.error,time
+          users={"admin":"synthetic-admin-password","no_read":"synthetic-noread-password","rowlimited":"synthetic-rowlimited-password"}
+          def send(q,who="admin",params=""):
+              url="http://127.0.0.1:8123/"+("?"+params if params else "")
+              req=urllib.request.Request(url,data=q.encode(),method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode((who+":"+users[who]).encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=25) as r:return r.status,r.read().decode(errors="replace").strip(),r.headers.get("X-ClickHouse-Query-Id","")
+              except urllib.error.HTTPError as e:return e.code,e.read().decode(errors="replace").strip(),e.headers.get("X-ClickHouse-Query-Id","")
+          def sql(q,who="admin",params=""):
+              c,b,qid=send(q,who,params)
+              print("SQL",who,repr(q),repr(params),c,repr(b[:240]),"QID",qid,flush=True)
+              return c,b
+          def must(q):
+              c,b=sql(q)
+              if c!=200:raise RuntimeError(f"SETUP_FAILURE {q}: {c} {b}")
+          must("CREATE DATABASE detached_lab")
+          must("CREATE TABLE detached_lab.source (id UInt32, note String) ENGINE=MergeTree ORDER BY id")
+          must("CREATE TABLE detached_lab.no_read_sink (id UInt32) ENGINE=MergeTree ORDER BY id")
+          must("CREATE TABLE detached_lab.rls_sink (id UInt32) ENGINE=MergeTree ORDER BY id")
+          must("INSERT INTO detached_lab.source VALUES (1,'VISIBLE'),(2,'HIDDEN'),(3,'HIDDEN2')")
+          must("CREATE USER no_read IDENTIFIED WITH plaintext_password BY 'synthetic-noread-password'")
+          must("CREATE USER rowlimited IDENTIFIED WITH plaintext_password BY 'synthetic-rowlimited-password'")
+          must("GRANT INSERT ON detached_lab.no_read_sink TO no_read")
+          must("GRANT INSERT ON detached_lab.rls_sink TO rowlimited")
+          must("GRANT SELECT ON detached_lab.source TO rowlimited")
+          must("CREATE ROW POLICY only_one ON detached_lab.source FOR SELECT USING id=1 TO rowlimited")
+          assert sql("SELECT id FROM detached_lab.source ORDER BY id LIMIT 10 SETTINGS max_execution_time=10,max_rows_to_read=100","no_read")[0]==403
+          c,b=sql("SELECT id FROM detached_lab.source ORDER BY id LIMIT 10 SETTINGS max_execution_time=10,max_rows_to_read=100","rowlimited")
+          if c!=200 or b.strip()!="1":raise AssertionError(f"RLS_PROTECTION_FAILED: {c} {b}")
+          print("NEGATIVE_CONTROL_NO_READ",sql("INSERT INTO detached_lab.no_read_sink SELECT id FROM detached_lab.source","no_read"),flush=True)
+          print("NEGATIVE_CONTROL_RLS_SYNC",sql("INSERT INTO detached_lab.rls_sink SELECT id FROM detached_lab.source","rowlimited"),flush=True)
+          # Direct RLS sync writes permitted id=1 only, so later expect at most two 1 rows.
+          p="run_query_in_background=1&query_id=security_detached_no_read_20261113"
+          a=sql("INSERT INTO detached_lab.no_read_sink SELECT id FROM detached_lab.source","no_read",p)
+          print("ASYNC_NO_READ_SUBMISSION",a,flush=True)
+          p="run_query_in_background=1&query_id=security_detached_rls_20261113"
+          b=sql("INSERT INTO detached_lab.rls_sink SELECT id FROM detached_lab.source","rowlimited",p)
+          print("ASYNC_RLS_SUBMISSION",b,flush=True)
+          time.sleep(3)
+          c,secret_rows=sql("SELECT id FROM detached_lab.no_read_sink ORDER BY id LIMIT 12 SETTINGS max_execution_time=10,max_rows_to_read=100")
+          c2,rls_rows=sql("SELECT id FROM detached_lab.rls_sink ORDER BY id LIMIT 12 SETTINGS max_execution_time=10,max_rows_to_read=100")
+          print("AFTER_BACKGROUND_NO_READ",repr(secret_rows),flush=True)
+          print("AFTER_BACKGROUND_RLS",repr(rls_rows),flush=True)
+          if c!=200 or c2!=200:raise RuntimeError("QUERY_SINK_FAILED")
+          if secret_rows.strip():
+              print("SECURITY_CANDIDATE_UNAUTHORIZED_SOURCE_READ",repr(secret_rows),flush=True)
+              raise AssertionError("Restricted user extracted source rows via detached execution")
+          if set(rls_rows.splitlines())-{"1"}:
+              print("SECURITY_CANDIDATE_RLS_BYPASS",repr(rls_rows),flush=True)
+              raise AssertionError("User extracted rows hidden by row policy via detached execution")
+          print("NO_BYPASS: source access and RLS remained enforced in detached query",flush=True)
+          PY
+          python3 /tmp/detached.py
+      - name: Docker log on failure
+        if: failure()
+        run: docker logs ch 2>&1 | tail -100
