@@ -27,7 +27,7 @@ jobs:
         run: |
           docker run -d --name teletraan-audit-db -e MYSQL_ROOT_PASSWORD=lab-only-password -e MYSQL_DATABASE=lab mysql:8.4
           for i in $(seq 1 100); do
-            if docker exec --env MYSQL_PWD=lab-only-password teletraan-audit-db mysqladmin ping -uroot --silent 2>/dev/null; then
+            if docker exec --env MYSQL_PWD=lab-only-password teletraan-audit-db mysql -uroot -N -e 'SELECT 1' >/dev/null 2>&1; then
               echo "MySQL ready"; break
             fi
             sleep 2
