@@ -108,11 +108,11 @@ jobs:
           good=[]
           with psycopg2.connect(dsn) as conn:
               with conn.cursor() as cur:
-                  bulk="".join(str(i)+"\\n" for i in range(220000))
+                  bulk="".join(str(i)+"\n" for i in range(220000))
                   assert len(bulk)>1024*1024, len(bulk)
                   print("STAGED_PAYLOAD_BYTES:",len(bulk),flush=True)
                   try:
-                      cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",io.StringIO(bulk+"malformed_last_row\\n"))
+                      cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",io.StringIO(bulk+"malformed_last_row\n"))
                       good.append(result("disk_spill_parse_error",False,"malformed COPY succeeded"))
                   except Exception as e:
                       count=admin("SELECT count() FROM pgwire_authz.copy_spill")
@@ -138,7 +138,7 @@ jobs:
                       good.append(result("disk_spill_copyfail",count=="0",f"rows_after={count}; error={str(e)[:150]}"))
           with psycopg2.connect(dsn) as conn:
               with conn.cursor() as cur:
-                  cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",io.StringIO("777\\n"))
+                  cur.copy_expert("COPY pgwire_authz.copy_spill FROM STDIN",io.StringIO("777\n"))
           count=admin("SELECT count() FROM pgwire_authz.copy_spill")
           good.append(result("positive_copy_recovery",count=="1",f"rows={count}"))
           print("SPILL_COUNTS:",sum(good),"/",len(good),flush=True)
