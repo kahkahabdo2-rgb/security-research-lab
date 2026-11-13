@@ -200,8 +200,11 @@ jobs:
               s,_=fetch('auditlab')
               if s in (200,403):break
               time.sleep(2)
-          print('READER_WRITE_STATUS=',fetch('auditlab','PUT','reader-token',{'CONTROL':'reject'})[0])
-          print('CROSS_ENV_WRITE_STATUS=',fetch('otherlab','PUT','writer-token',{'CONTROL':'reject'})[0])
+          reader_status=fetch('auditlab','PUT','reader-token',{'CONTROL':'reject'})[0]
+          cross_status=fetch('otherlab','PUT','writer-token',{'CONTROL':'reject'})[0]
+          assert reader_status==403,reader_status
+          assert cross_status==403,cross_status
+          print('READER_WRITE_DENIED=403 CROSS_ENV_WRITE_DENIED=403')
           s,_=fetch('auditlab','PUT','writer-token',{'ROLE_CONTROL':'small'})
           print('WRITER_SMALL_PUT_STATUS=',s)
           assert s==204,s
