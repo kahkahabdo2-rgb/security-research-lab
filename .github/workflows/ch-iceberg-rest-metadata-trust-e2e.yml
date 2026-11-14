@@ -77,12 +77,12 @@ jobs:
               if c!=200:raise RuntimeError(f"SETUP: {q}: {c}, {b}")
           must("CREATE DATABASE lake ENGINE=DataLakeCatalog('http://rest:8181/v1', 'labroot', 'synthetic-root-password') SETTINGS catalog_type='rest', warehouse='s3://iceberg-data', storage_endpoint='http://minio:9000/iceberg-data', vended_credentials=0","allow_database_iceberg=1")
           for name in ["A","B"]:
-              must(f"CREATE TABLE lake.\\`default.{name}\\` (id Int64,note String) ENGINE=IcebergS3('http://minio:9000/iceberg-data/warehouse/default/{name}/','labroot','synthetic-root-password')", "allow_database_iceberg=1&write_full_path_in_iceberg_metadata=1")
+              must(f"CREATE TABLE lake.\`default.{name}\` (id Int64,note String) ENGINE=IcebergS3('http://minio:9000/iceberg-data/warehouse/default/{name}/','labroot','synthetic-root-password')", "allow_database_iceberg=1&write_full_path_in_iceberg_metadata=1")
               value=733331 if name=="B" else 111
-              must(f"INSERT INTO lake.\\`default.{name}\\` VALUES ({value}, 'SYNTHETIC_{name}')", "allow_experimental_insert_into_iceberg=1")
+              must(f"INSERT INTO lake.\`default.{name}\` VALUES ({value}, 'SYNTHETIC_{name}')", "allow_experimental_insert_into_iceberg=1")
           c,b=sql("SHOW TABLES FROM lake")
-          c,a=sql("SELECT id,note FROM lake.\\`default.A\\` LIMIT 5 SETTINGS max_execution_time=20,max_rows_to_read=50")
-          c,b=sql("SELECT id,note FROM lake.\\`default.B\\` LIMIT 5 SETTINGS max_execution_time=20,max_rows_to_read=50")
+          c,a=sql("SELECT id,note FROM lake.\`default.A\` LIMIT 5 SETTINGS max_execution_time=20,max_rows_to_read=50")
+          c,b=sql("SELECT id,note FROM lake.\`default.B\` LIMIT 5 SETTINGS max_execution_time=20,max_rows_to_read=50")
           for name in ["A","B"]:
               url=f"http://127.0.0.1:18181/v1/namespaces/default/tables/{name}"
               with urllib.request.urlopen(url,timeout=20) as f:data=json.load(f)
