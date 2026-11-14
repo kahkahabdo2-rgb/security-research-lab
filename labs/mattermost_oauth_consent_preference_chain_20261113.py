@@ -31,11 +31,18 @@ def login(name,pw):
     st,_,h=request("POST","/api/v4/users/login",{"login_id":name,"password":pw})
     must(st,200,"login")
     return h["Token"]
-def oauth_register():
-    st,j,_=request("POST","/api/v4/oauth/apps/register",{"redirect_uris":[CALLBACK],
-       "token_endpoint_auth_method":"none","client_name":"owned-dsi-"+secrets.token_hex(5)})
-    must(st,201,"DCR")
-    return j["client_id"]
+def oauth_register(creator_token):
+    # Legitimate, routine admin-created public OAuth app. No DCR involved.
+    st,j,_=request("POST","/api/v4/oauth/apps",{
+       "name":"owned-dsi-"+secrets.token_hex(5),
+       "description":"Temporary consent isolation E2E",
+       "callback_urls":[CALLBACK],"homepage":"https://approved.example.invalid/",
+       "is_public":True,"is_trusted":False
+    },token=creator_token)
+    if st!=201:
+        print("OAUTH_APP_CREATE_STATUS "+str(st)+" error_id="+str(j.get("id","")),flush=True)
+    must(st,201,"native admin OAuth app registration")
+    return j["id"]
 def challenge():
     verifier=secrets.token_urlsafe(49)
     digest=hashlib.sha256(verifier.encode()).digest()
@@ -100,9 +107,9 @@ def main():
     st,_,_=request("GET",f"/api/v4/channels/{cid}/posts")
     check("A02_anonymous_private_posts_denied",st==401,st,401)
 
-    app_a=oauth_register()
-    app_b=oauth_register()
-    app_c=oauth_register()
+    app_a=oauth_register(owner_token)
+    app_b=oauth_register(owner_token)
+    app_c=oauth_register(owner_token)
     verifier_a,pkce_a=challenge();verifier_b,pkce_b=challenge();verifier_c,pkce_c=challenge()
     st,out,h=browser_visit(app_b,pkce_b,normal_token)
     # Verify browser has NOT granted app B yet, and does not redirect to its callback.
@@ -205,7 +212,7 @@ def main():
     st,_,_=request("GET",f"/api/v4/channels/{cid}/posts",token=access_a)
     check("A15_revoked_A_cannot_read_same_content",st==401,st,401)
     print("RESULTS "+json.dumps({
-       "chain":"DCR A/B/C -> victim grants A once -> A OAuth bearer writes B/C oauth_app preferences -> A GET /oauth/authorize B (POST denied 403) -> obtains B token without user B interaction -> victim revokes A -> A dead, B reads private posts -> C gets fresh post-revocation grant without consent",
+       "chain":"DCR DISABLED; routine admin-created untrusted OAuth apps A/B/C -> victim grants A once -> A OAuth bearer writes B/C oauth_app preferences -> A GET /oauth/authorize B (POST denied 403) -> obtains B token without user B interaction -> victim revokes A -> A dead, B reads private posts -> C gets fresh post-revocation grant without consent",
        "failed":[r["test"] for r in RESULTS if not r["pass"]],"total":len(RESULTS)},sort_keys=True),flush=True)
     if any(not x["pass"] for x in RESULTS):sys.exit(2)
 if __name__=="__main__":
