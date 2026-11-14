@@ -1,0 +1,103 @@
+name: Iceberg REST catalog metadata trust boundary E2E
+on:
+  push:
+    branches: [research-ch-iceberg-rest-metadata-trust-20261114]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - name: Start official MinIO + Iceberg REST catalog + ClickHouse
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker network create iceberg-lab
+          docker run -d --name minio --network iceberg-lab -p 19000:9000 \
+            -e MINIO_ROOT_USER=labroot -e MINIO_ROOT_PASSWORD=synthetic-root-password \
+            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --address :9000
+          python3 -m pip install --user --quiet boto3
+          python3 - <<'PY'
+          import boto3,time
+          from botocore.config import Config
+          cli=boto3.client("s3",endpoint_url="http://localhost:19000",aws_access_key_id="labroot",aws_secret_access_key="synthetic-root-password",region_name="us-east-1",config=Config(s3={"addressing_style":"path"}))
+          for i in range(45):
+              try:
+                  cli.list_buckets();break
+              except Exception:time.sleep(2)
+          else:raise SystemExit("MINIO_NOT_READY")
+          cli.create_bucket(Bucket="iceberg-data")
+          print("MINIO_BUCKET_CREATED")
+          PY
+          docker run -d --name rest --network iceberg-lab -p 18181:8181 \
+            -e AWS_ACCESS_KEY_ID=labroot \
+            -e AWS_SECRET_ACCESS_KEY=synthetic-root-password \
+            -e AWS_REGION=us-east-1 \
+            -e CATALOG_WAREHOUSE=s3://iceberg-data/ \
+            -e CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO \
+            -e CATALOG_S3_ENDPOINT=http://minio:9000 \
+            -e CATALOG_S3_PATH__STYLE__ACCESS=true \
+            tabulario/iceberg-rest:1.6.0
+          for i in {1..75}; do
+            if curl -fsS http://127.0.0.1:18181/v1/config >/tmp/rest_config.json; then break; fi
+            sleep 2
+          done
+          cat /tmp/rest_config.json
+          docker run -d --name ch --network iceberg-lab -p 18123:8123 --memory 3g \
+            --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_USER=admin -e CLICKHOUSE_PASSWORD=synthetic-admin-password \
+            -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 \
+            clickhouse/clickhouse-server:head
+          for i in {1..100}; do
+            if curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:18123/?query=SELECT%201' >/dev/null; then break; fi
+            sleep 2
+          done
+          curl -fsS -u admin:synthetic-admin-password 'http://127.0.0.1:18123/?query=SELECT%20version()'
+      - name: Create two real Iceberg tables through official REST catalog
+        shell: bash
+        run: |
+          cat >/tmp/test.py <<'PY'
+          import base64,urllib.request,urllib.error,json,boto3
+          from botocore.config import Config
+          base="http://127.0.0.1:18123/"
+          s3=boto3.client("s3",endpoint_url="http://localhost:19000",aws_access_key_id="labroot",aws_secret_access_key="synthetic-root-password",region_name="us-east-1",config=Config(s3={"addressing_style":"path"}))
+          def sql(q,who="admin",password="synthetic-admin-password",params=""):
+              url=base+("?"+params if params else "")
+              req=urllib.request.Request(url,data=q.encode(),method="POST")
+              req.add_header("Authorization","Basic "+base64.b64encode(f"{who}:{password}".encode()).decode())
+              try:
+                  with urllib.request.urlopen(req,timeout=60) as r:c,b=r.status,r.read().decode(errors="replace").strip()
+              except urllib.error.HTTPError as e:c,b=e.code,e.read().decode(errors="replace").strip()
+              print("SQL",who,repr(q[:230]),"STATUS",c,"OUTPUT",repr(b[:1500]),flush=True)
+              return c,b
+          def must(q,params=""):
+              c,b=sql(q,params=params)
+              if c!=200:raise RuntimeError(f"SETUP: {q}: {c}, {b}")
+          must("CREATE DATABASE lake ENGINE=DataLakeCatalog('http://rest:8181/v1', 'labroot', 'synthetic-root-password') SETTINGS catalog_type='rest', warehouse='s3://iceberg-data', storage_endpoint='http://minio:9000/iceberg-data', vended_credentials=0","allow_database_iceberg=1")
+          for name in ["A","B"]:
+              must(f"CREATE TABLE lake.\\`default.{name}\\` (id Int64,note String) ENGINE=IcebergS3('http://minio:9000/iceberg-data/warehouse/default/{name}/','labroot','synthetic-root-password')", "allow_database_iceberg=1&write_full_path_in_iceberg_metadata=1")
+              value=733331 if name=="B" else 111
+              must(f"INSERT INTO lake.\\`default.{name}\\` VALUES ({value}, 'SYNTHETIC_{name}')", "allow_experimental_insert_into_iceberg=1")
+          c,b=sql("SHOW TABLES FROM lake")
+          c,a=sql("SELECT id,note FROM lake.\\`default.A\\` LIMIT 5 SETTINGS max_execution_time=20,max_rows_to_read=50")
+          c,b=sql("SELECT id,note FROM lake.\\`default.B\\` LIMIT 5 SETTINGS max_execution_time=20,max_rows_to_read=50")
+          for name in ["A","B"]:
+              url=f"http://127.0.0.1:18181/v1/namespaces/default/tables/{name}"
+              with urllib.request.urlopen(url,timeout=20) as f:data=json.load(f)
+              info={"name":name,"location":data.get("metadata",{}).get("location"),"metadata-location":data.get("metadata-location"),"uuid":data.get("metadata",{}).get("table-uuid"),"current-snapshot-id":data.get("metadata",{}).get("current-snapshot-id")}
+              print("CATALOG_TABLE",json.dumps(info),flush=True)
+          for x in s3.list_objects_v2(Bucket="iceberg-data").get("Contents",[]):
+              print("S3_OBJECT",x["Key"],x["Size"],flush=True)
+          if "733331" not in b or "111" not in a:raise AssertionError("ICEBERG_BASELINE_BROKEN")
+          print("BASELINE_READY_WITH_TWO_REAL_TABLES",flush=True)
+          PY
+          python3 /tmp/test.py
+      - name: Diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          docker logs rest 2>&1 | tail -80 || true
+          docker logs ch 2>&1 | tail -95 || true
+          docker logs minio 2>&1 | tail -50 || true
