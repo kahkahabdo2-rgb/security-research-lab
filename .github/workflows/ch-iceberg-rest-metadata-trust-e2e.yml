@@ -17,7 +17,7 @@ jobs:
           docker network create iceberg-lab
           docker run -d --name minio --network iceberg-lab -p 19000:9000 \
             -e MINIO_ROOT_USER=labroot -e MINIO_ROOT_PASSWORD=synthetic-root-password \
-            minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --address :9000
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --address :9000
           python3 -m pip install --user --quiet boto3
           python3 - <<'PY'
           import boto3,time
